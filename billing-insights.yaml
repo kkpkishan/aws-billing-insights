@@ -1,0 +1,1360 @@
+---
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "AWS Billing Insights - Lambda + Bedrock LLM analysis with cost forecast, SP utilization, linked accounts, region breakdown, budget alerts, idle detection, and YoY comparison"
+Parameters:
+  Region:
+    Type: String
+    Default: ap-south-1
+    AllowedValues:
+      - us-east-1
+      - us-east-2
+      - us-west-1
+      - us-west-2
+      - ap-south-1
+      - ap-southeast-1
+      - ap-southeast-2
+      - ap-northeast-1
+      - ap-northeast-2
+      - eu-west-1
+      - eu-west-2
+      - eu-west-3
+      - eu-central-1
+      - eu-north-1
+      - sa-east-1
+      - ca-central-1
+    Description: AWS Region where the stack is deployed (must support Amazon Bedrock)
+  ModelId:
+    Type: String
+    Default: openai.gpt-oss-120b-1:0
+    AllowedValues:
+      - openai.gpt-oss-120b-1:0
+      - openai.gpt-oss-20b-1:0
+      - zai.glm-4.7-flash
+      - amazon.nova-pro-v1:0
+      - amazon.nova-micro-v1:0
+      - amazon.nova-lite-v1:0
+      - anthropic.claude-3-haiku-20240307-v1:0
+    Description: >-
+      Bedrock LLM model for billing analysis. All models support ap-south-1 with no marketplace subscription.
+  snsTopicArn:
+    Description: SNS Topic ARN for sending billing insight notifications
+    Type: String
+    Default: arn:aws:sns:ap-south-1:ACCOUNT_ID:aws-billing-insights
+  ExcludeCredits:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Exclude AWS credits from cost data (true = net cost, false = gross cost)
+  ExcludeTax:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Exclude tax charges from cost data (true = pre-tax, false = with tax)
+  Granularity:
+    Type: String
+    Default: MONTHLY
+    AllowedValues: ["MONTHLY", "DAILY"]
+    Description: Cost data granularity. MONTHLY for trends, DAILY for spike detection.
+  MonthlyBudget:
+    Type: Number
+    Default: 0
+    Description: Monthly budget in USD. Set to 0 to disable budget alerts. If spend exceeds this, report flags critical alert.
+  EnableForecast:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Enable next-month cost forecast using Cost Explorer GetCostForecast API.
+  EnableSPUtilization:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Include Savings Plans utilization data in the report.
+  EnableRIUtilization:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Include Reserved Instances utilization data in the report.
+  EnableLinkedAccounts:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Break down costs by linked account (requires AWS Organizations).
+  EnableCostByRegion:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Break down costs by AWS region.
+  EnableYoYComparison:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Compare same months last year vs this year for seasonal trend analysis. Note - AWS Cost Explorer only keeps 14 months of historical data, so this may fail for older periods.
+  IncludeCurrentMonth:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Include current month (month-to-date) billing data in the report. When enabled, shows 4 months total (3 complete + current partial month).
+  EnableServiceRecommendations:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Include service-specific cost optimization recommendations (EC2, RDS, S3, Lambda, NAT Gateway).
+  EnableCostOptimization:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Detect idle/unused resources (EC2, RDS, EBS volumes, Elastic IPs, snapshots).
+  EnableHistoricalTrends:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Show 6-month historical trends and growth rate analysis (MoM, QoQ).
+  CurrencyCode:
+    Type: String
+    Default: USD
+    AllowedValues: ["USD", "EUR", "GBP", "JPY", "CNY", "INR", "AUD", "CAD"]
+    Description: Currency for cost reporting. Note - AWS Cost Explorer returns USD, conversion is informational only.
+  EnableDataTransferAnalysis:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Break down data transfer costs (inter-region, inter-AZ, internet egress).
+  EnableIdleResourceDetection:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Detect idle resources (low CPU EC2, unused EBS, unattached EIPs, old snapshots).
+  ScheduleExpr:
+    Type: String
+    Default: rate(30 days)
+    AllowedValues:
+      - rate(1 day)
+      - rate(7 days)
+      - rate(30 days)
+      - cron(0 0 1 * ? *)
+      - cron(0 0 L * ? *)
+      - cron(0 0 15 * ? *)
+      - cron(0 0 ? * MON *)
+      - cron(0 0 ? * FRI *)
+      - cron(0 0 ? * 1 *)
+      - cron(0 0 1 1 ? *)
+      - cron(0 0 1 */3 ? *)
+      - cron(0 0 1 */6 ? *)
+    Description: >-
+      Schedule for Lambda execution. Options: rate(1 day)=Daily, rate(7 days)=Weekly, rate(30 days)=Monthly,
+      cron(0 0 1 * ? *)=1st of every month, cron(0 0 L * ? *)=Last day of every month,
+      cron(0 0 15 * ? *)=15th of every month, cron(0 0 ? * MON *)=Every Monday,
+      cron(0 0 ? * FRI *)=Every Friday, cron(0 0 ? * 1 *)=Every Sunday,
+      cron(0 0 1 1 ? *)=January 1st yearly, cron(0 0 1 */3 ? *)=Quarterly (1st day),
+      cron(0 0 1 */6 ? *)=Semi-annually (1st day).
+###################################################################
+Resources:
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: [sts:AssumeRole]
+          Effect: Allow
+          Principal:
+            Service: [lambda.amazonaws.com]
+        Version: '2012-10-17'
+      Path: "/"
+      Policies:
+      - PolicyDocument:
+          Statement:
+          - Action:
+            - ce:GetCostAndUsage
+            - ce:GetCostForecast
+            - ce:GetSavingsPlansUtilizationDetails
+            - ce:GetSavingsPlansCoverage
+            - ce:GetReservationUtilization
+            Effect: Allow
+            Resource: "*"
+          - Action: [bedrock:InvokeModel]
+            Effect: Allow
+            Resource:
+              - arn:aws:bedrock:*::foundation-model/*
+              - Fn::Sub: arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*
+          - Action: [logs:CreateLogStream, logs:PutLogEvents]
+            Effect: Allow
+            Resource:
+              Fn::Sub: arn:aws:logs:${AWS::Region}:*:log-group:/aws/lambda/${AWS::StackName}-${AWS::AccountId}-${AWS::Region}:*
+          - Action: [logs:CreateLogGroup]
+            Effect: Allow
+            Resource:
+              Fn::Sub: arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*
+          - Action: [sns:Publish]
+            Effect: Allow
+            Resource:
+              Ref: snsTopicArn
+          - Action: [organizations:ListAccounts]
+            Effect: Allow
+            Resource: "*"
+          - Action:
+            - ec2:DescribeInstances
+            - ec2:DescribeVolumes
+            - ec2:DescribeAddresses
+            - ec2:DescribeSnapshots
+            - ec2:DescribeNatGateways
+            - cloudwatch:GetMetricStatistics
+            - rds:DescribeDBInstances
+            - rds:DescribeDBClusters
+            - s3:ListAllMyBuckets
+            - s3:GetBucketLocation
+            - s3:GetBucketLifecycleConfiguration
+            - lambda:ListFunctions
+            - compute-optimizer:GetEC2InstanceRecommendations
+            - compute-optimizer:GetEBSVolumeRecommendations
+            Effect: Allow
+            Resource: "*"
+          Version: '2012-10-17'
+        PolicyName:
+          Fn::Sub: AWS-USG-${AWS::StackName}-${AWS::Region}
+      RoleName:
+        Fn::Sub: AWS-USG-${AWS::StackName}-${AWS::Region}
+
+  EventRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: [sts:AssumeRole]
+          Effect: Allow
+          Principal:
+            Service: [scheduler.amazonaws.com]
+        Version: '2012-10-17'
+      Path: "/"
+      Policies:
+      - PolicyDocument:
+          Statement:
+          - Action: [lambda:InvokeFunction]
+            Effect: Allow
+            Resource:
+            - Fn::GetAtt: LambdaFunction.Arn
+          Version: '2012-10-17'
+        PolicyName:
+          Fn::Sub: AWS-USG-Event-${AWS::StackName}-${AWS::Region}
+      RoleName:
+        Fn::Sub: AWS-USG-Event-${AWS::StackName}-${AWS::Region}
+
+###################################################################
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Generate billing insights with forecast, SP util, linked accounts, region, budget, idle, YoY
+      FunctionName:
+        Fn::Sub: ${AWS::StackName}-${AWS::AccountId}-${AWS::Region}
+      Handler: index.lambda_handler
+      Environment:
+        Variables:
+          Months: 3
+          TargetArn:
+            Ref: snsTopicArn
+          ModelId:
+            Ref: ModelId
+          ExcludeCredits:
+            Ref: ExcludeCredits
+          ExcludeTax:
+            Ref: ExcludeTax
+          Granularity:
+            Ref: Granularity
+          MonthlyBudget:
+            Ref: MonthlyBudget
+          EnableForecast:
+            Ref: EnableForecast
+          EnableSPUtilization:
+            Ref: EnableSPUtilization
+          EnableRIUtilization:
+            Ref: EnableRIUtilization
+          EnableLinkedAccounts:
+            Ref: EnableLinkedAccounts
+          EnableCostByRegion:
+            Ref: EnableCostByRegion
+          EnableYoYComparison:
+            Ref: EnableYoYComparison
+          IncludeCurrentMonth:
+            Ref: IncludeCurrentMonth
+          EnableServiceRecommendations:
+            Ref: EnableServiceRecommendations
+          EnableCostOptimization:
+            Ref: EnableCostOptimization
+          EnableHistoricalTrends:
+            Ref: EnableHistoricalTrends
+          CurrencyCode:
+            Ref: CurrencyCode
+          EnableDataTransferAnalysis:
+            Ref: EnableDataTransferAnalysis
+          EnableIdleResourceDetection:
+            Ref: EnableIdleResourceDetection
+      Role:
+        Fn::GetAtt: LambdaRole.Arn
+      ReservedConcurrentExecutions: 1
+      MemorySize: 512
+      Code:
+        ZipFile: |
+          import boto3, os, json, re
+          from datetime import datetime, timedelta
+          from dateutil.relativedelta import relativedelta
+          from collections import defaultdict
+          from urllib import request
+          from urllib.error import URLError
+
+          def env_bool(key, default='false'):
+              return os.environ.get(key, default).lower() == 'true'
+
+          def get_currency_rates(target_currency='USD', historical_date=None):
+              """
+              Fetch currency conversion rates from Frankfurter API
+              API: https://frankfurter.dev/
+              Returns rates for converting USD to target currency
+              """
+              try:
+                  if target_currency == 'USD':
+                      return {'rate': 1.0, 'date': datetime.now().date().isoformat(), 'source': 'N/A'}
+                  
+                  # Build API URL - Frankfurter API v1 endpoint
+                  if historical_date:
+                      # Historical rates: https://api.frankfurter.dev/v1/2024-01-01?base=USD&symbols=INR
+                      url = f"https://api.frankfurter.dev/v1/{historical_date}?base=USD&symbols={target_currency}"
+                  else:
+                      # Latest rates: https://api.frankfurter.dev/v1/latest?base=USD&symbols=INR
+                      url = f"https://api.frankfurter.dev/v1/latest?base=USD&symbols={target_currency}"
+                  
+                  print(f"[Currency] Fetching rate from: {url}")
+                  
+                  req = request.Request(url, headers={'User-Agent': 'AWS-Lambda-Billing-Insights/1.0'})
+                  with request.urlopen(req, timeout=10) as response:
+                      data = json.loads(response.read().decode('utf-8'))
+                      rate = data.get('rates', {}).get(target_currency)
+                      rate_date = data.get('date', 'unknown')
+                      
+                      if rate:
+                          print(f"[Currency] Success: 1 USD = {rate} {target_currency} (date: {rate_date})")
+                          return {
+                              'rate': float(rate),
+                              'date': rate_date,
+                              'source': 'Frankfurter API (European Central Bank)'
+                          }
+                      else:
+                          print(f"[Currency] ERROR: {target_currency} not found in API response")
+                          return None
+              except URLError as e:
+                  print(f"[Currency] ERROR: URLError - {e}")
+                  return None
+              except Exception as e:
+                  print(f"[Currency] ERROR: {type(e).__name__} - {e}")
+                  return None
+
+          def convert_currency(amount, target_currency='USD', rate_info=None):
+              """Convert USD amount to target currency using provided rate info"""
+              if target_currency == 'USD' or not rate_info:
+                  return amount
+              rate = rate_info.get('rate', 1.0)
+              return round(amount * rate, 2)
+
+          def build_ce_filter():
+              exclude = []
+              if env_bool('ExcludeCredits', 'true'):
+                  exclude.append('Credit')
+              if env_bool('ExcludeTax', 'true'):
+                  exclude.append('Tax')
+              if exclude:
+                  return {'Not': {'Dimensions': {'Key': 'RECORD_TYPE', 'Values': exclude}}}
+              return None
+
+          def get_historical_trends(ce, ce_filter):
+              """Get 6-month historical cost trends"""
+              try:
+                  end_date = datetime.now().date().replace(day=1)
+                  start_date = (end_date + relativedelta(months=-6)).replace(day=1)
+                  params = {
+                      'TimePeriod': {'Start': start_date.isoformat(), 'End': end_date.isoformat()},
+                      'Granularity': 'MONTHLY',
+                      'Metrics': ['UnblendedCost']
+                  }
+                  if ce_filter:
+                      params['Filter'] = ce_filter
+                  resp = ce.get_cost_and_usage(**params)
+                  monthly = []
+                  for r in resp['ResultsByTime']:
+                      cost = float(r['Total']['UnblendedCost']['Amount'])
+                      monthly.append({'month': r['TimePeriod']['Start'], 'cost': round(cost, 2)})
+                  
+                  # Calculate growth rates
+                  if len(monthly) >= 2:
+                      mom = round((monthly[-1]['cost'] - monthly[-2]['cost']) / monthly[-2]['cost'] * 100, 1) if monthly[-2]['cost'] > 0 else 0
+                  else:
+                      mom = 0
+                  
+                  if len(monthly) >= 4:
+                      q_current = sum(m['cost'] for m in monthly[-3:])
+                      q_previous = sum(m['cost'] for m in monthly[-6:-3])
+                      qoq = round((q_current - q_previous) / q_previous * 100, 1) if q_previous > 0 else 0
+                  else:
+                      qoq = 0
+                  
+                  return {'monthly': monthly, 'mom_growth': mom, 'qoq_growth': qoq}
+              except Exception as e:
+                  print(f"Historical trends error: {e}")
+                  return {}
+
+          def get_data_transfer_costs(ce, start, end, ce_filter):
+              """Analyze data transfer costs"""
+              try:
+                  params = {
+                      'TimePeriod': {'Start': start, 'End': end},
+                      'Granularity': 'MONTHLY',
+                      'Metrics': ['UnblendedCost'],
+                      'GroupBy': [{'Type': 'DIMENSION', 'Key': 'USAGE_TYPE'}]
+                  }
+                  if ce_filter:
+                      params['Filter'] = ce_filter
+                  resp = ce.get_cost_and_usage(**params)
+                  
+                  transfer_costs = {'inter_region': 0, 'inter_az': 0, 'internet_egress': 0}
+                  for r in resp['ResultsByTime']:
+                      for g in r['Groups']:
+                          usage_type = g['Keys'][0]
+                          cost = float(g['Metrics']['UnblendedCost']['Amount'])
+                          
+                          if 'DataTransfer-Regional' in usage_type:
+                              transfer_costs['inter_region'] += cost
+                          elif 'DataTransfer-In' in usage_type or 'DataTransfer-Out' in usage_type:
+                              transfer_costs['inter_az'] += cost
+                          elif 'DataTransfer' in usage_type or 'Egress' in usage_type:
+                              transfer_costs['internet_egress'] += cost
+                  
+                  return {k: round(v, 2) for k, v in transfer_costs.items() if v > 0.01}
+              except Exception as e:
+                  print(f"Data transfer analysis error: {e}")
+                  return {}
+
+          def detect_idle_resources(region):
+              """Detect idle and unused resources"""
+              try:
+                  ec2 = boto3.client('ec2', region_name=region)
+                  cloudwatch = boto3.client('cloudwatch', region_name=region)
+                  rds = boto3.client('rds', region_name=region)
+                  
+                  idle_resources = {
+                      'low_cpu_ec2': [],
+                      'unused_ebs': [],
+                      'unattached_eips': [],
+                      'old_snapshots': [],
+                      'idle_rds': []
+                  }
+                  
+                  # Low CPU EC2 instances (limit to first 20 for performance)
+                  try:
+                      instances = ec2.describe_instances(Filters=[{'Name': 'instance-state-name', 'Values': ['running']}], MaxResults=20)
+                      end_time = datetime.utcnow()
+                      start_time = end_time - timedelta(days=7)
+                      
+                      for reservation in instances['Reservations']:
+                          for instance in reservation['Instances']:
+                              instance_id = instance['InstanceId']
+                              try:
+                                  metrics = cloudwatch.get_metric_statistics(
+                                      Namespace='AWS/EC2',
+                                      MetricName='CPUUtilization',
+                                      Dimensions=[{'Name': 'InstanceId', 'Value': instance_id}],
+                                      StartTime=start_time,
+                                      EndTime=end_time,
+                                      Period=86400,
+                                      Statistics=['Average']
+                                  )
+                                  if metrics['Datapoints']:
+                                      avg_cpu = sum(d['Average'] for d in metrics['Datapoints']) / len(metrics['Datapoints'])
+                                      if avg_cpu < 5:
+                                          idle_resources['low_cpu_ec2'].append({
+                                              'id': instance_id,
+                                              'type': instance['InstanceType'],
+                                              'avg_cpu': round(avg_cpu, 1)
+                                          })
+                              except Exception:
+                                  pass
+                  except Exception as e:
+                      print(f"EC2 idle detection error: {e}")
+                  
+                  # Unattached EBS volumes
+                  try:
+                      volumes = ec2.describe_volumes(Filters=[{'Name': 'status', 'Values': ['available']}], MaxResults=100)
+                      for vol in volumes['Volumes']:
+                          idle_resources['unused_ebs'].append({
+                              'id': vol['VolumeId'],
+                              'size': vol['Size'],
+                              'type': vol['VolumeType']
+                          })
+                      print(f"[Idle Resources] Found {len(idle_resources['unused_ebs'])} unattached EBS volumes")
+                  except Exception as e:
+                      print(f"[Idle Resources] EBS detection error: {e}")
+                  
+                  # Unattached Elastic IPs
+                  try:
+                      addresses = ec2.describe_addresses()
+                      for addr in addresses['Addresses']:
+                          if 'InstanceId' not in addr and 'NetworkInterfaceId' not in addr:
+                              idle_resources['unattached_eips'].append({
+                                  'ip': addr.get('PublicIp', 'N/A'),
+                                  'allocation_id': addr.get('AllocationId', 'N/A')
+                              })
+                  except Exception as e:
+                      print(f"EIP detection error: {e}")
+                  
+                  # Old snapshots (>90 days, limit to 100)
+                  try:
+                      snapshots = ec2.describe_snapshots(OwnerIds=['self'], MaxResults=100)
+                      if snapshots['Snapshots']:
+                          cutoff_date = datetime.now(snapshots['Snapshots'][0]['StartTime'].tzinfo) - timedelta(days=90)
+                          for snap in snapshots['Snapshots']:
+                              if snap['StartTime'] < cutoff_date:
+                                  idle_resources['old_snapshots'].append({
+                                      'id': snap['SnapshotId'],
+                                      'age_days': (datetime.now(snap['StartTime'].tzinfo) - snap['StartTime']).days,
+                                      'size': snap['VolumeSize']
+                                  })
+                      print(f"[Idle Resources] Found {len(idle_resources['old_snapshots'])} old snapshots (>90 days)")
+                  except Exception as e:
+                      print(f"[Idle Resources] Snapshot detection error: {e}")
+                  
+                  # Idle RDS instances (limit to 20)
+                  try:
+                      db_instances = rds.describe_db_instances(MaxRecords=20)
+                      for db in db_instances['DBInstances']:
+                          if db['DBInstanceStatus'] == 'available':
+                              db_id = db['DBInstanceIdentifier']
+                              try:
+                                  metrics = cloudwatch.get_metric_statistics(
+                                      Namespace='AWS/RDS',
+                                      MetricName='DatabaseConnections',
+                                      Dimensions=[{'Name': 'DBInstanceIdentifier', 'Value': db_id}],
+                                      StartTime=datetime.utcnow() - timedelta(days=7),
+                                      EndTime=datetime.utcnow(),
+                                      Period=86400,
+                                      Statistics=['Average']
+                                  )
+                                  if metrics['Datapoints']:
+                                      avg_conn = sum(d['Average'] for d in metrics['Datapoints']) / len(metrics['Datapoints'])
+                                      if avg_conn < 1:
+                                          idle_resources['idle_rds'].append({
+                                              'id': db_id,
+                                              'engine': db['Engine'],
+                                              'class': db['DBInstanceClass'],
+                                              'avg_connections': round(avg_conn, 1)
+                                          })
+                              except Exception:
+                                  pass
+                      print(f"[Idle Resources] Found {len(idle_resources['idle_rds'])} idle RDS instances")
+                  except Exception as e:
+                      print(f"[Idle Resources] RDS idle detection error: {e}")
+                  
+                  return {k: v for k, v in idle_resources.items() if v}
+              except Exception as e:
+                  print(f"Idle resource detection error: {e}")
+                  return {}
+
+          def get_service_recommendations(ce, start, end, region):
+              """Get service-specific cost optimization recommendations"""
+              try:
+                  ec2 = boto3.client('ec2', region_name=region)
+                  s3 = boto3.client('s3')
+                  
+                  recommendations = []
+                  
+                  # EC2 stopped instances with EBS costs
+                  try:
+                      stopped = ec2.describe_instances(Filters=[{'Name': 'instance-state-name', 'Values': ['stopped']}], MaxResults=50)
+                      stopped_count = sum(len(r['Instances']) for r in stopped['Reservations'])
+                      if stopped_count > 0:
+                          recommendations.append(f"Found {stopped_count} stopped EC2 instances still incurring EBS storage costs. Consider terminating or creating AMIs.")
+                  except Exception:
+                      pass
+                  
+                  # S3 buckets without lifecycle policies
+                  try:
+                      buckets = s3.list_buckets()
+                      no_lifecycle = 0
+                      for bucket in buckets['Buckets'][:20]:
+                          try:
+                              s3.get_bucket_lifecycle_configuration(Bucket=bucket['Name'])
+                          except s3.exceptions.NoSuchLifecycleConfiguration:
+                              no_lifecycle += 1
+                          except Exception:
+                              pass
+                      if no_lifecycle > 0:
+                          recommendations.append(f"{no_lifecycle} S3 buckets lack lifecycle policies. Consider adding policies to transition old data to cheaper storage classes.")
+                  except Exception:
+                      pass
+                  
+                  # NAT Gateway costs
+                  try:
+                      nat_gateways = ec2.describe_nat_gateways(Filters=[{'Name': 'state', 'Values': ['available']}])
+                      nat_count = len(nat_gateways['NatGateways'])
+                      if nat_count > 0:
+                          recommendations.append(f"Found {nat_count} NAT Gateways. Consider VPC endpoints for AWS services to reduce data transfer costs.")
+                  except Exception:
+                      pass
+                  
+                  return recommendations
+              except Exception as e:
+                  print(f"Service recommendations error: {e}")
+                  return []
+
+          def get_cost_by_service(ce, start, end, granularity, ce_filter):
+              params = {
+                  'TimePeriod': {'Start': start, 'End': end},
+                  'Granularity': granularity,
+                  'Metrics': ['UnblendedCost', 'UsageQuantity'],
+                  'GroupBy': [{'Type': 'DIMENSION', 'Key': 'SERVICE'}]
+              }
+              if ce_filter:
+                  params['Filter'] = ce_filter
+              resp = ce.get_cost_and_usage(**params)
+              data = []
+              for r in resp['ResultsByTime']:
+                  for g in r['Groups']:
+                      data.append({
+                          'Period': r['TimePeriod']['Start'],
+                          'Service': g['Keys'][0],
+                          'Cost': round(float(g['Metrics']['UnblendedCost']['Amount']), 2),
+                          'Usage': round(float(g['Metrics']['UsageQuantity']['Amount']), 2)
+                      })
+              return data
+
+          def get_cost_by_region(ce, start, end, ce_filter):
+              params = {
+                  'TimePeriod': {'Start': start, 'End': end},
+                  'Granularity': 'MONTHLY',
+                  'Metrics': ['UnblendedCost'],
+                  'GroupBy': [{'Type': 'DIMENSION', 'Key': 'REGION'}]
+              }
+              if ce_filter:
+                  params['Filter'] = ce_filter
+              resp = ce.get_cost_and_usage(**params)
+              region_totals = defaultdict(float)
+              for r in resp['ResultsByTime']:
+                  for g in r['Groups']:
+                      region_totals[g['Keys'][0]] += float(g['Metrics']['UnblendedCost']['Amount'])
+              return {k: round(v, 2) for k, v in sorted(region_totals.items(), key=lambda x: x[1], reverse=True) if v > 0.01}
+
+          def get_cost_by_linked_account(ce, start, end, ce_filter):
+              params = {
+                  'TimePeriod': {'Start': start, 'End': end},
+                  'Granularity': 'MONTHLY',
+                  'Metrics': ['UnblendedCost'],
+                  'GroupBy': [{'Type': 'DIMENSION', 'Key': 'LINKED_ACCOUNT'}]
+              }
+              if ce_filter:
+                  params['Filter'] = ce_filter
+              try:
+                  resp = ce.get_cost_and_usage(**params)
+              except Exception:
+                  return {}
+              acct_totals = defaultdict(float)
+              for r in resp['ResultsByTime']:
+                  for g in r['Groups']:
+                      acct_totals[g['Keys'][0]] += float(g['Metrics']['UnblendedCost']['Amount'])
+              # Sort by cost descending and return only top 20
+              sorted_accounts = sorted(acct_totals.items(), key=lambda x: x[1], reverse=True)
+              return {k: round(v, 2) for k, v in sorted_accounts[:20] if v > 0.01}
+
+          def get_forecast(ce, end_date_str):
+              try:
+                  start = end_date_str
+                  end_dt = datetime.strptime(end_date_str, '%Y-%m-%d').date() + relativedelta(months=1)
+                  resp = ce.get_cost_forecast(
+                      TimePeriod={'Start': start, 'End': end_dt.isoformat()},
+                      Metric='UNBLENDED_COST',
+                      Granularity='MONTHLY'
+                  )
+                  total = resp.get('Total', {})
+                  return round(float(total.get('Amount', 0)), 2)
+              except Exception as e:
+                  print(f"Forecast error: {e}")
+                  return None
+
+          def get_sp_utilization(ce, start, end):
+              try:
+                  resp = ce.get_savings_plans_utilization_details(
+                      TimePeriod={'Start': start, 'End': end}
+                  )
+                  results = []
+                  for item in resp.get('SavingsPlansUtilizationDetails', []):
+                      util = item.get('Utilization', {})
+                      results.append({
+                          'sp_arn': item.get('SavingsPlanArn', 'N/A'),
+                          'utilization_pct': round(float(util.get('UtilizationPercentage', 0)), 1),
+                          'total_commitment': round(float(util.get('TotalCommitment', 0)), 2),
+                          'used_commitment': round(float(util.get('UsedCommitment', 0)), 2),
+                          'unused_commitment': round(float(util.get('UnusedCommitment', 0)), 2)
+                      })
+                  return results
+              except Exception as e:
+                  print(f"SP utilization error: {e}")
+                  return []
+
+          def get_ri_utilization(ce, start, end):
+              try:
+                  resp = ce.get_reservation_utilization(
+                      TimePeriod={'Start': start, 'End': end},
+                      Granularity='MONTHLY'
+                      # Removed GroupBy - not supported for RI utilization
+                  )
+                  results = []
+                  
+                  # Get the total summary
+                  total = resp.get('Total', {}).get('Utilization', {})
+                  summary = {
+                      'total_utilization_pct': round(float(total.get('UtilizationPercentage', 0)), 1),
+                      'total_purchased_hours': round(float(total.get('PurchasedHours', 0)), 1),
+                      'total_used_hours': round(float(total.get('UsedHours', 0)), 1),
+                      'total_unused_hours': round(float(total.get('UnusedHours', 0)), 1),
+                      'total_unused_cost': round(float(total.get('UnusedRecurringFee', 0)), 2)
+                  }
+                  
+                  print(f"[RI Utilization] Overall: {summary['total_utilization_pct']}% utilized, ${summary['total_unused_cost']} wasted")
+                  return {'summary': summary, 'by_instance': results}
+              except Exception as e:
+                  print(f"[RI Utilization] ERROR: {e}")
+                  return {}
+
+          def compute_insights(cost_data):
+              monthly_totals = defaultdict(float)
+              svc_monthly = defaultdict(lambda: defaultdict(float))
+              svc_totals = defaultdict(float)
+              svc_usage = defaultdict(float)
+              for e in cost_data:
+                  monthly_totals[e['Period']] += e['Cost']
+                  svc_monthly[e['Service']][e['Period']] += e['Cost']
+                  svc_totals[e['Service']] += e['Cost']
+                  svc_usage[e['Service']] += e['Usage']
+              months = sorted(monthly_totals.keys())
+              grand_total = sum(monthly_totals.values())
+              monthly_summary = []
+              for i, m in enumerate(months):
+                  row = {'month': m, 'spend': round(monthly_totals[m], 2)}
+                  if i > 0:
+                      prev = monthly_totals[months[i-1]]
+                      row['mom_pct'] = round((monthly_totals[m] - prev) / prev * 100, 1) if prev > 0 else 0.0
+                  monthly_summary.append(row)
+              sorted_svcs = sorted(svc_totals.items(), key=lambda x: x[1], reverse=True)
+              top5 = [{'service': s, 'total': round(t, 2), 'pct': round(t/grand_total*100, 1) if grand_total > 0 else 0} for s, t in sorted_svcs[:5]]
+              big_changes = []
+              for svc in svc_totals:
+                  for i in range(1, len(months)):
+                      p = svc_monthly[svc].get(months[i-1], 0)
+                      c = svc_monthly[svc].get(months[i], 0)
+                      if p > 0.01:
+                          pct = round((c - p) / p * 100, 1)
+                      elif c > 0.01:
+                          pct = 999.9
+                      else:
+                          continue
+                      if abs(pct) > 10:
+                          big_changes.append({'service': svc, 'from_m': months[i-1], 'to_m': months[i], 'from_c': round(p, 2), 'to_c': round(c, 2), 'pct': pct})
+              idle = []
+              return {
+                  'grand_total': round(grand_total, 2),
+                  'monthly_summary': monthly_summary,
+                  'top5': top5,
+                  'big_changes': big_changes,
+                  'all_svcs': {k: round(v, 2) for k, v in sorted_svcs if v > 0.005}
+              }
+
+          def lambda_handler(event, context):
+              try:
+                  ce = boto3.client('ce')
+                  bedrock = boto3.client('bedrock-runtime')
+                  sns = boto3.client('sns')
+
+                  TargetSNSArn = os.environ["TargetArn"]
+                  month_delta = int(os.environ["Months"])
+                  raw_model = os.environ["ModelId"]
+                  granularity = os.environ.get('Granularity', 'MONTHLY')
+                  budget = float(os.environ.get('MonthlyBudget', '0'))
+
+                  # Resolve model ID with cross-region prefix
+                  _region = os.environ.get('AWS_REGION', 'ap-south-1')
+                  if _region.startswith('us'): _prefix = 'us'
+                  elif _region.startswith('eu') or _region == 'il-central-1': _prefix = 'eu'
+                  elif _region.startswith('ap') or _region in ('me-central-1',): _prefix = 'apac'
+                  else: _prefix = 'us'
+                  if any(raw_model.startswith(p) for p in ('amazon.nova', 'anthropic.claude')):
+                      model_id = f"{_prefix}.{raw_model}"
+                  else:
+                      model_id = raw_model
+                  print(f"model_id: {model_id}")
+
+                  # Date ranges
+                  end_date = datetime.now().date().replace(day=1)
+                  start_date = (end_date + relativedelta(months=-month_delta)).replace(day=1)
+                  start_str = start_date.isoformat()
+                  end_str = end_date.isoformat()
+
+                  # If IncludeCurrentMonth is enabled, extend end_date to today
+                  include_current = env_bool('IncludeCurrentMonth', 'false')
+                  if include_current:
+                      end_date_actual = datetime.now().date()
+                      end_str_actual = end_date_actual.isoformat()
+                  else:
+                      end_str_actual = end_str
+
+                  ce_filter = build_ce_filter()
+
+                  # 1. Always fetch MONTHLY data for summary, budget, executive summary
+                  monthly_cost_data = get_cost_by_service(ce, start_str, end_str_actual, 'MONTHLY', ce_filter)
+                  insights = compute_insights(monthly_cost_data)
+                  account_id = context.invoked_function_arn.split(':')[4]
+                  acct_region = context.invoked_function_arn.split(':')[3]
+
+                  # 1b. If DAILY granularity, also fetch daily data for spike detection
+                  daily_spikes = []
+                  if granularity == 'DAILY':
+                      daily_cost_data = get_cost_by_service(ce, start_str, end_str_actual, 'DAILY', ce_filter)
+                      # Compute daily totals
+                      daily_totals = defaultdict(float)
+                      for e in daily_cost_data:
+                          daily_totals[e['Period']] += e['Cost']
+                      days_sorted = sorted(daily_totals.items())
+                      # Find days with spend > 2x the average (real spikes, not noise)
+                      if days_sorted:
+                          avg_daily = sum(v for _, v in days_sorted) / len(days_sorted)
+                          for day, spend in days_sorted:
+                              if spend > avg_daily * 2 and spend > 1.0:
+                                  daily_spikes.append({'date': day, 'spend': round(spend, 2), 'avg': round(avg_daily, 2)})
+                          # Also find top 5 most expensive days
+                          top_days = sorted(days_sorted, key=lambda x: x[1], reverse=True)[:5]
+                          daily_spikes_info = {
+                              'avg_daily': round(avg_daily, 2),
+                              'top_days': [{'date': d, 'spend': round(s, 2)} for d, s in top_days],
+                              'spike_days': daily_spikes
+                          }
+                      else:
+                          daily_spikes_info = {}
+                  else:
+                      daily_spikes_info = {}
+
+                  # 2. Cost forecast
+                  forecast = None
+                  if env_bool('EnableForecast', 'true'):
+                      forecast = get_forecast(ce, end_str_actual)
+
+                  # 3. Savings Plans utilization
+                  sp_data = []
+                  if env_bool('EnableSPUtilization', 'true'):
+                      sp_data = get_sp_utilization(ce, start_str, end_str_actual)
+
+                  # 3b. Reserved Instances utilization
+                  ri_data = {}
+                  if env_bool('EnableRIUtilization', 'true'):
+                      ri_data = get_ri_utilization(ce, start_str, end_str_actual)
+
+                  # 4. Cost by linked account
+                  linked_accounts = {}
+                  if env_bool('EnableLinkedAccounts', 'false'):
+                      linked_accounts = get_cost_by_linked_account(ce, start_str, end_str_actual, ce_filter)
+
+                  # 5. Cost by region                  region_costs = {}
+                  if env_bool('EnableCostByRegion', 'true'):
+                      region_costs = get_cost_by_region(ce, start_str, end_str_actual, ce_filter)
+
+                  # 6. Year-over-Year comparison
+                  yoy_data = {}
+                  if env_bool('EnableYoYComparison', 'false'):
+                      # Calculate YoY dates - limit to 12 months max to avoid API errors
+                      yoy_months = min(month_delta, 12)
+                      yoy_start = (start_date + relativedelta(years=-1)).isoformat()
+                      yoy_end = (start_date + relativedelta(years=-1, months=yoy_months)).isoformat()
+                      try:
+                          print(f"[YoY] Fetching data from {yoy_start} to {yoy_end}")
+                          yoy_raw = get_cost_by_service(ce, yoy_start, yoy_end, 'MONTHLY', ce_filter)
+                          yoy_monthly = defaultdict(float)
+                          for e in yoy_raw:
+                              yoy_monthly[e['Period']] += e['Cost']
+                          yoy_data = {k: round(v, 2) for k, v in sorted(yoy_monthly.items())}
+                          print(f"[YoY] Retrieved {len(yoy_data)} months of historical data")
+                      except Exception as e:
+                          print(f"[YoY] ERROR: {e} - YoY comparison will be excluded from report")
+                          yoy_data = {}  # Clear data so it won't be included in report
+
+                  # 7. Historical trends (6 months)
+                  historical_trends = {}
+                  if env_bool('EnableHistoricalTrends', 'true'):
+                      historical_trends = get_historical_trends(ce, ce_filter)
+
+                  # 8. Data transfer analysis
+                  data_transfer = {}
+                  if env_bool('EnableDataTransferAnalysis', 'true'):
+                      data_transfer = get_data_transfer_costs(ce, start_str, end_str_actual, ce_filter)
+
+                  # 9. Idle resource detection
+                  idle_resources = {}
+                  if env_bool('EnableIdleResourceDetection', 'true'):
+                      idle_resources = detect_idle_resources(acct_region)
+
+                  # 10. Service recommendations
+                  service_recommendations = []
+                  if env_bool('EnableServiceRecommendations', 'true'):
+                      service_recommendations = get_service_recommendations(ce, start_str, end_str_actual, acct_region)
+
+                  # Currency conversion with month-specific historical rates
+                  currency = os.environ.get('CurrencyCode', 'USD')
+                  
+                  print(f"[Currency] Target currency: {currency}")
+                  
+                  # Fetch current currency rate (for forecast and current month)
+                  current_rate_info = get_currency_rates(currency)
+                  
+                  # Fetch historical rates for EACH month in the report (1st day of each month)
+                  historical_rates = {}
+                  if currency != 'USD' and current_rate_info:
+                      print(f"[Currency] Fetching historical exchange rates for {currency}...")
+                      for month_data in insights['monthly_summary']:
+                          month_str = month_data['month']  # Format: YYYY-MM-DD (always 1st of month)
+                          rate_info = get_currency_rates(currency, month_str)
+                          if rate_info:
+                              historical_rates[month_str] = rate_info
+                          else:
+                              # Fallback to current rate if historical rate unavailable
+                              historical_rates[month_str] = current_rate_info
+                              print(f"[Currency] Using current rate for {month_str} (historical unavailable)")
+                  
+                  # Convert ALL costs from USD to target currency using appropriate rates
+                  if currency != 'USD' and current_rate_info:
+                      print(f"[Currency] Converting all costs from USD to {currency}...")
+                      
+                      # Convert grand total (use average of all monthly rates for accuracy)
+                      if historical_rates:
+                          avg_rate = sum(r['rate'] for r in historical_rates.values()) / len(historical_rates)
+                          insights['grand_total'] = round(insights['grand_total'] * avg_rate, 2)
+                          print(f"[Currency] Grand total converted using avg rate: {avg_rate}")
+                      else:
+                          insights['grand_total'] = convert_currency(insights['grand_total'], currency, current_rate_info)
+                      
+                      # Convert monthly summary - CRITICAL: Use month-specific rate for each month
+                      for month_data in insights['monthly_summary']:
+                          month_str = month_data['month']
+                          rate_info = historical_rates.get(month_str, current_rate_info)
+                          original_usd = month_data['spend']
+                          month_data['spend'] = convert_currency(original_usd, currency, rate_info)
+                          month_data['exchange_rate'] = rate_info['rate']  # Store rate for display
+                          month_data['rate_date'] = rate_info['date']
+                      
+                      # Convert big_changes (MoM changes) - CRITICAL: Convert USD amounts
+                      for change in insights['big_changes']:
+                          from_month = change['from_m']
+                          to_month = change['to_m']
+                          from_rate = historical_rates.get(from_month, current_rate_info)
+                          to_rate = historical_rates.get(to_month, current_rate_info)
+                          change['from_c'] = convert_currency(change['from_c'], currency, from_rate)
+                          change['to_c'] = convert_currency(change['to_c'], currency, to_rate)
+                      
+                      # Convert top 5 services (use average rate)
+                      avg_rate_info = {'rate': avg_rate if historical_rates else current_rate_info['rate']}
+                      for svc in insights['top5']:
+                          svc['total'] = convert_currency(svc['total'], currency, avg_rate_info)
+                      
+                      # Convert forecast (use current/latest rate)
+                      if forecast is not None:
+                          forecast = convert_currency(forecast, currency, current_rate_info)
+                      
+                      # Convert SP utilization data
+                      if sp_data:
+                          for sp in sp_data:
+                              sp['total_commitment'] = convert_currency(sp['total_commitment'], currency, current_rate_info)
+                              sp['used_commitment'] = convert_currency(sp['used_commitment'], currency, current_rate_info)
+                              sp['unused_commitment'] = convert_currency(sp['unused_commitment'], currency, current_rate_info)
+                      
+                      # Convert RI utilization data
+                      if ri_data and ri_data.get('summary'):
+                          ri_data['summary']['total_unused_cost'] = convert_currency(ri_data['summary']['total_unused_cost'], currency, current_rate_info)
+                      
+                      # Convert linked accounts (use average rate)
+                      if linked_accounts:
+                          linked_accounts = {k: convert_currency(v, currency, avg_rate_info) for k, v in linked_accounts.items()}
+                      
+                      # Convert region costs (use average rate)
+                      if region_costs:
+                          region_costs = {k: convert_currency(v, currency, avg_rate_info) for k, v in region_costs.items()}
+                      
+                      # Convert data transfer costs (use average rate)
+                      if data_transfer:
+                          data_transfer = {k: convert_currency(v, currency, avg_rate_info) for k, v in data_transfer.items()}
+                      
+                      # Convert daily spikes data if present
+                      if daily_spikes_info:
+                          if daily_spikes_info.get('avg_daily'):
+                              daily_spikes_info['avg_daily'] = convert_currency(daily_spikes_info['avg_daily'], currency, current_rate_info)
+                          for td in daily_spikes_info.get('top_days', []):
+                              td['spend'] = convert_currency(td['spend'], currency, current_rate_info)
+                          for sd in daily_spikes_info.get('spike_days', []):
+                              sd['spend'] = convert_currency(sd['spend'], currency, current_rate_info)
+                              sd['avg'] = convert_currency(sd['avg'], currency, current_rate_info)
+                      
+                      # Convert YoY data (use historical rates if available)
+                      if yoy_data:
+                          converted_yoy = {}
+                          for month_str, cost in yoy_data.items():
+                              rate_info = get_currency_rates(currency, month_str)
+                              if rate_info:
+                                  converted_yoy[month_str] = convert_currency(cost, currency, rate_info)
+                              else:
+                                  converted_yoy[month_str] = convert_currency(cost, currency, avg_rate_info)
+                          yoy_data = converted_yoy
+                      
+                      # Convert historical trends - CRITICAL: Use month-specific rates
+                      if historical_trends and historical_trends.get('monthly'):
+                          for m in historical_trends['monthly']:
+                              month_str = m['month']
+                              rate_info = get_currency_rates(currency, month_str)
+                              if not rate_info:
+                                  rate_info = historical_rates.get(month_str, current_rate_info)
+                              m['cost'] = convert_currency(m['cost'], currency, rate_info)
+                              m['exchange_rate'] = rate_info['rate']
+                      
+                      print(f"[Currency] Conversion complete")
+
+                  # Build prompt with all pre-computed data
+                  P = []
+                  P.append(f"Billing insights for AWS account {account_id}, region {acct_region}.")
+                  if include_current:
+                      P.append(f"Period: {start_str} to {end_str_actual} ({month_delta} complete months + current month-to-date). Grand total: {currency}{insights['grand_total']}")
+                  else:
+                      P.append(f"Period: {start_str} to {end_str_actual} ({month_delta} months). Grand total: {currency}{insights['grand_total']}")
+                  
+                  if currency != 'USD' and current_rate_info:
+                      P.append(f"Currency: {currency} (Rate: 1 USD = {current_rate_info['rate']} {currency} as of {current_rate_info['date']}, Source: {current_rate_info['source']})")
+                      if historical_rates:
+                          P.append("Historical rates used for each month's conversion (month-specific rates applied).")
+                  P.append("")
+                  P.append("USE THESE EXACT NUMBERS. DO NOT RECALCULATE.")
+                  P.append("")
+                  P.append("MONTHLY TOTALS:")
+                  for ms in insights['monthly_summary']:
+                      line = f"  {ms['month']}: {currency}{ms['spend']}"
+                      if 'mom_pct' in ms: line += f" (MoM: {ms['mom_pct']}%)"
+                      if currency != 'USD' and 'exchange_rate' in ms:
+                          line += f" [Rate: 1 USD = {ms['exchange_rate']} {currency} on {ms['rate_date']}]"
+                      P.append(line)
+
+                  P.append("")
+                  P.append("TOP 5 COST DRIVERS:")
+                  for i, t in enumerate(insights['top5'], 1):
+                      P.append(f"  {i}. {t['service']}: {currency}{t['total']} ({t['pct']}%)")
+
+                  P.append("")
+                  P.append("SERVICES WITH >10% MOM CHANGE:")
+                  for c in insights['big_changes']:
+                      P.append(f"  {c['service']}: {c['from_m']} {currency}{c['from_c']} -> {c['to_m']} {currency}{c['to_c']} ({c['pct']}%)")
+                  if not insights['big_changes']:
+                      P.append("  None")
+
+                  if daily_spikes_info:
+                      P.append("")
+                      P.append(f"DAILY ANALYSIS (avg daily spend: {currency}{daily_spikes_info['avg_daily']}):")
+                      P.append("  Top 5 most expensive days:")
+                      for td in daily_spikes_info.get('top_days', []):
+                          P.append(f"    {td['date']}: {currency}{td['spend']}")
+                      if daily_spikes_info.get('spike_days'):
+                          P.append("  Spike days (>2x average daily spend):")
+                          for sd in daily_spikes_info['spike_days']:
+                              P.append(f"    {sd['date']}: {currency}{sd['spend']} (avg: {currency}{sd['avg']})")
+                      else:
+                          P.append("  No significant daily spikes detected.")
+
+                  if forecast is not None:
+                      P.append("")
+                      P.append(f"NEXT MONTH FORECAST: {currency}{forecast}")
+
+                  if budget > 0:
+                      P.append("")
+                      latest = insights['monthly_summary'][-1]['spend'] if insights['monthly_summary'] else 0
+                      budget_pct = round(latest / budget * 100, 1) if budget > 0 else 0
+                      P.append(f"BUDGET ALERT: Monthly budget {currency}{budget}, latest month spend {currency}{latest} ({budget_pct}% of budget)")
+                      if latest > budget:
+                          P.append(f"  CRITICAL: Spend EXCEEDS budget by {currency}{round(latest - budget, 2)}")
+                      elif budget_pct > 80:
+                          P.append(f"  WARNING: Spend is at {budget_pct}% of budget")
+
+                  if sp_data:
+                      P.append("")
+                      P.append("SAVINGS PLANS UTILIZATION:")
+                      for sp in sp_data:
+                          short_arn = sp['sp_arn'].split('/')[-1] if '/' in sp['sp_arn'] else sp['sp_arn']
+                          P.append(f"  Plan {short_arn}: {sp['utilization_pct']}% utilized, committed {currency}{sp['total_commitment']}, used {currency}{sp['used_commitment']}, unused {currency}{sp['unused_commitment']}")
+
+                  if ri_data and ri_data.get('summary'):
+                      s = ri_data['summary']
+                      P.append("")
+                      P.append("RESERVED INSTANCES UTILIZATION:")
+                      P.append(f"  Overall: {s['total_utilization_pct']}% utilized, {s['total_purchased_hours']}h purchased, {s['total_used_hours']}h used, {s['total_unused_hours']}h unused, {currency}{s['total_unused_cost']} wasted")
+                      for item in ri_data.get('by_instance', []):
+                          if item['utilization_pct'] < 100:
+                              P.append(f"  {item['instance_type']} ({item['period']}): {item['utilization_pct']}% utilized, {item['unused_hours']}h unused, ${item['unused_cost']} wasted")
+
+                  if linked_accounts:
+                      P.append("")
+                      P.append("COST BY LINKED ACCOUNT (Top 20 by spend):")
+                      for acct, cost in linked_accounts.items():
+                          P.append(f"  Account {acct}: {currency}{cost}")
+
+                  if region_costs:
+                      P.append("")
+                      P.append("COST BY REGION:")
+                      for rgn, cost in region_costs.items():
+                          P.append(f"  {rgn}: {currency}{cost}")
+
+                  if yoy_data:
+                      P.append("")
+                      P.append("YEAR-OVER-YEAR COMPARISON (same months last year):")
+                      for m, cost in yoy_data.items():
+                          P.append(f"  {m}: {currency}{cost}")
+
+                  if historical_trends and historical_trends.get('monthly'):
+                      P.append("")
+                      P.append("6-MONTH HISTORICAL TRENDS:")
+                      for m in historical_trends['monthly']:
+                          line = f"  {m['month']}: {currency}{m['cost']}"
+                          if currency != 'USD' and 'exchange_rate' in m:
+                              line += f" [Rate: 1 USD = {m['exchange_rate']} {currency}]"
+                          P.append(line)
+                      P.append(f"  Month-over-Month Growth: {historical_trends.get('mom_growth', 0)}%")
+                      P.append(f"  Quarter-over-Quarter Growth: {historical_trends.get('qoq_growth', 0)}%")
+
+                  if data_transfer:
+                      P.append("")
+                      P.append("DATA TRANSFER COSTS:")
+                      if data_transfer.get('inter_region'):
+                          P.append(f"  Inter-Region Transfer: {currency}{data_transfer['inter_region']}")
+                      if data_transfer.get('inter_az'):
+                          P.append(f"  Inter-AZ Transfer: {currency}{data_transfer['inter_az']}")
+                      if data_transfer.get('internet_egress'):
+                          P.append(f"  Internet Egress: {currency}{data_transfer['internet_egress']}")
+
+                  if idle_resources:
+                      P.append("")
+                      P.append("IDLE/UNUSED RESOURCES DETECTED:")
+                      if idle_resources.get('low_cpu_ec2'):
+                          P.append(f"  Low CPU EC2 Instances (<5% avg): {len(idle_resources['low_cpu_ec2'])} instances")
+                          for inst in idle_resources['low_cpu_ec2'][:5]:
+                              P.append(f"    - {inst['id']} ({inst['type']}): {inst['avg_cpu']}% CPU")
+                      if idle_resources.get('unused_ebs'):
+                          total_size = sum(v['size'] for v in idle_resources['unused_ebs'])
+                          P.append(f"  Unattached EBS Volumes: {len(idle_resources['unused_ebs'])} volumes, {total_size} GB total")
+                      if idle_resources.get('unattached_eips'):
+                          P.append(f"  Unattached Elastic IPs: {len(idle_resources['unattached_eips'])} IPs (${0.005 * 24 * 30 * len(idle_resources['unattached_eips']):.2f}/month waste)")
+                      if idle_resources.get('old_snapshots'):
+                          P.append(f"  Old Snapshots (>90 days): {len(idle_resources['old_snapshots'])} snapshots")
+                      if idle_resources.get('idle_rds'):
+                          P.append(f"  Idle RDS Instances (<1 avg connection): {len(idle_resources['idle_rds'])} databases")
+                          for db in idle_resources['idle_rds'][:3]:
+                              P.append(f"    - {db['id']} ({db['engine']}, {db['class']}): {db['avg_connections']} avg connections")
+
+                  if service_recommendations:
+                      P.append("")
+                      P.append("SERVICE-SPECIFIC RECOMMENDATIONS:")
+                      for i, rec in enumerate(service_recommendations, 1):
+                          P.append(f"  {i}. {rec}")
+
+                  P.append("")
+                  P.append("ALL SERVICE TOTALS:")
+                  for svc, total in insights['all_svcs'].items():
+                      P.append(f"  {svc}: ${total}")
+
+                  P.append("")
+                  P.append("INSTRUCTIONS: Write a plain-text billing report using EXACT numbers above.")
+                  P.append("Include sections: COST SUMMARY, TOP 5 DRIVERS, MOM CHANGES, ANOMALIES, RECOMMENDATIONS, RISK ALERTS.")
+                  if forecast is not None: P.append("Include section: COST FORECAST (use the forecast number above).")
+                  if budget > 0: P.append("Include section: BUDGET STATUS (use the budget data above).")
+                  if sp_data: P.append("Include section: SAVINGS PLANS UTILIZATION (flag under-utilized plans).")
+                  if ri_data: P.append("Include section: RESERVED INSTANCES UTILIZATION (flag under-utilized RIs, highlight wasted cost).")
+                  if linked_accounts: P.append("Include section: COST BY LINKED ACCOUNT (top 20 only).")
+                  if region_costs: P.append("Include section: COST BY REGION (flag expensive regions).")
+                  if daily_spikes_info: P.append("Include section: DAILY SPIKE ANALYSIS (highlight the most expensive days and any spikes above 2x average).")
+                  if yoy_data: P.append("Include section: YEAR-OVER-YEAR COMPARISON.")
+                  if historical_trends: P.append("Include section: HISTORICAL TRENDS (6-month trends, MoM and QoQ growth rates).")
+                  if data_transfer: P.append("Include section: DATA TRANSFER COSTS (inter-region, inter-AZ, internet egress breakdown).")
+                  if idle_resources: P.append("Include section: IDLE RESOURCES (list all detected idle/unused resources with cost impact).")
+                  if service_recommendations: P.append("Include section: OPTIMIZATION RECOMMENDATIONS (service-specific cost savings opportunities).")
+                  if currency != 'USD' and current_rate_info: 
+                      P.append(f"IMPORTANT: All costs converted from USD to {currency} using month-specific exchange rates.")
+                      P.append(f"Each month's costs use the exchange rate from the 1st day of that month (shown in brackets).")
+                      P.append(f"Current/forecast rate: 1 USD = {current_rate_info['rate']} {currency} (as of {current_rate_info['date']}).")
+                      P.append(f"Exchange rate source: {current_rate_info['source']} (European Central Bank data).")
+                  P.append("FORMATTING: Plain text only. No markdown. Numbered lists and indentation only. No reasoning/thinking blocks.")
+
+                  prompt = "\n".join(P)
+
+                  # Build request per model provider
+                  if raw_model.startswith("openai.") or raw_model.startswith("zai."):
+                      req = {"messages": [{"role": "user", "content": prompt}]}
+                  else:
+                      req = {"messages": [{"role": "user", "content": [{"text": prompt}]}]}
+
+                  br_resp = bedrock.invoke_model(modelId=model_id, body=json.dumps(req), accept="application/json")
+                  body = json.loads(br_resp['body'].read().decode('utf-8'))
+                  result = None
+                  if 'output' in body and 'message' in body['output']:
+                      c = body['output']['message'].get('content', [])
+                      if c: result = c[0].get('text')
+                  elif 'content' in body and body['content']:
+                      result = body['content'][0].get('text')
+                  elif 'choices' in body and body['choices']:
+                      result = body['choices'][0].get('message', {}).get('content')
+                  elif 'completion' in body:
+                      result = body['completion']
+
+                  if result:
+                      result = re.sub(r'<reasoning>.*?</reasoning>', '', result, flags=re.DOTALL).strip()
+                      result = re.sub(r'<thinking>.*?</thinking>', '', result, flags=re.DOTALL).strip()
+                      result = re.sub(r'\*{1,3}', '', result)
+                      result = re.sub(r'^#{1,6}\s*', '', result, flags=re.MULTILINE)
+                      result = re.sub(r'`{1,3}', '', result)
+                      result = re.sub(r'\n{3,}', '\n\n', result).strip()
+
+                      labels = []
+                      if env_bool('ExcludeCredits', 'true'): labels.append("excl. credits")
+                      if env_bool('ExcludeTax', 'true'): labels.append("excl. tax")
+                      lbl = ", ".join(labels) if labels else "gross"
+                      subj = f'AWS Billing Insights - Account: {account_id}, Region: {acct_region} ({lbl})'
+
+                      # Build executive summary (pure Python, no LLM)
+                      S = []
+                      S.append("=" * 60)
+                      S.append("EXECUTIVE SUMMARY")
+                      S.append("=" * 60)
+                      if include_current:
+                          S.append(f"Account: {account_id}  |  Region: {acct_region}  |  Period: {start_str} to {end_str_actual} (incl. current month MTD)")
+                      else:
+                          S.append(f"Account: {account_id}  |  Region: {acct_region}  |  Period: {start_str} to {end_str_actual}")
+                      S.append("")
+
+                      # Overall spend + trend
+                      ms = insights['monthly_summary']
+                      if len(ms) >= 2:
+                          first_m = ms[0]['spend']
+                          last_m = ms[-1]['spend']
+                          overall_pct = round((last_m - first_m) / first_m * 100, 1) if first_m > 0 else 0
+                          if overall_pct > 5:
+                              trend = f"INCREASING (+{overall_pct}%)"
+                          elif overall_pct < -5:
+                              trend = f"DECREASING ({overall_pct}%)"
+                          else:
+                              trend = f"STABLE ({overall_pct}%)"
+                      else:
+                          trend = "N/A"
+                          last_m = ms[0]['spend'] if ms else 0
+
+                      S.append(f"Total Spend ({month_delta} months): {currency}{insights['grand_total']}")
+                      S.append(f"Latest Month: {currency}{last_m}  |  Trend: {trend}")
+
+                      # Forecast
+                      if forecast is not None:
+                          S.append(f"Next Month Forecast: {currency}{forecast}")
+
+                      # Budget status
+                      if budget > 0:
+                          budget_pct_val = round(last_m / budget * 100, 1) if budget > 0 else 0
+                          if last_m > budget:
+                              S.append(f"Budget Status: OVER BUDGET ({currency}{last_m} / {currency}{budget} = {budget_pct_val}%)")
+                          elif budget_pct_val > 80:
+                              S.append(f"Budget Status: WARNING ({currency}{last_m} / {currency}{budget} = {budget_pct_val}%)")
+                          else:
+                              S.append(f"Budget Status: OK ({currency}{last_m} / {currency}{budget} = {budget_pct_val}%)")
+
+                      # SP utilization one-liner
+                      if sp_data:
+                          avg_util = round(sum(s['utilization_pct'] for s in sp_data) / len(sp_data), 1)
+                          total_unused = round(sum(s['unused_commitment'] for s in sp_data), 2)
+                          S.append(f"Savings Plans: {avg_util}% avg utilization, {currency}{total_unused} unused commitment")
+
+                      # RI utilization one-liner
+                      if ri_data and ri_data.get('summary'):
+                          rs = ri_data['summary']
+                          S.append(f"Reserved Instances: {rs['total_utilization_pct']}% utilized, {rs['total_unused_hours']}h unused, {currency}{rs['total_unused_cost']} wasted")
+
+                      # Top spender
+                      if insights['top5']:
+                          t1 = insights['top5'][0]
+                          S.append(f"Top Spender: {t1['service']} ({currency}{t1['total']}, {t1['pct']}% of total)")
+
+                      # Action needed?
+                      alerts = []
+                      if budget > 0 and last_m > budget:
+                          alerts.append("over budget")
+                      if sp_data and avg_util < 70:
+                          alerts.append("low SP utilization")
+                      if ri_data and ri_data.get('summary') and ri_data['summary']['total_utilization_pct'] < 70:
+                          alerts.append("low RI utilization")
+                      if daily_spikes_info and daily_spikes_info.get('spike_days'):
+                          alerts.append(f"{len(daily_spikes_info['spike_days'])} daily cost spikes detected")
+                      if len(insights['big_changes']) > 3:
+                          alerts.append(f"{len(insights['big_changes'])} services with >10% cost swings")
+                      if idle_resources:
+                          total_idle = sum(len(v) for v in idle_resources.values())
+                          alerts.append(f"{total_idle} idle/unused resources detected")
+
+                      S.append("")
+                      if alerts:
+                          S.append(f"ACTION NEEDED: {', '.join(alerts).upper()}")
+                      else:
+                          S.append("STATUS: No critical issues. Review details below for optimization opportunities.")
+
+                      # Add currency note if not USD
+                      if currency != 'USD' and current_rate_info:
+                          S.append("")
+                          S.append(f"CURRENCY CONVERSION: USD to {currency}")
+                          S.append(f"Method: Month-specific exchange rates (1st day of each month)")
+                          S.append(f"Current Rate: 1 USD = {current_rate_info['rate']} {currency} (as of {current_rate_info['date']})")
+                          S.append(f"Data Source: {current_rate_info['source']}")
+                          if historical_rates:
+                              S.append(f"Historical Rates Applied: {len(historical_rates)} months")
+                              # Show sample of rates
+                              sample_months = list(historical_rates.items())[:3]
+                              for month, rate_info in sample_months:
+                                  S.append(f"  {month}: 1 USD = {rate_info['rate']} {currency}")
+
+                      S.append("=" * 60)
+                      S.append("")
+
+                      # Prepend executive summary to LLM report
+                      result = "\n".join(S) + "\n" + result
+                      resp = sns.publish(TargetArn=TargetSNSArn, Subject=subj, Message=result, MessageStructure='text')
+                      print(resp)
+                      return {'statusCode': 200, 'body': json.dumps({'message': 'Sent', 'msgId': resp['MessageId']})}
+                  else:
+                      return {'statusCode': 200, 'body': json.dumps({'message': 'No analysis available'})}
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {'statusCode': 500, 'body': json.dumps({'error': str(e)})}
+      Runtime: python3.13
+      Timeout: 900
+      TracingConfig:
+        Mode: Active
+
+###################################################################
+  ScheduledRule0:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Description: Scheduled Rule for lambda execution
+      State: ENABLED
+      ScheduleExpression:
+        Ref: ScheduleExpr
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      Target:
+        Arn:
+          Fn::GetAtt: LambdaFunction.Arn
+        RoleArn:
+          Fn::GetAtt: EventRole.Arn
+
+  PermissionForEventsToInvokeLambda0:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName:
+        Fn::Sub: ${AWS::StackName}-${AWS::AccountId}-${AWS::Region}
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn:
+        Fn::GetAtt: ScheduledRule0.Arn
