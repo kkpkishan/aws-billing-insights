@@ -39,7 +39,7 @@ Parameters:
   snsTopicArn:
     Description: SNS Topic ARN for sending billing insight notifications
     Type: String
-    Default: arn:aws:sns:ap-south-1:ACCOUNT_ID:aws-billing-insights
+    Default: arn:aws:sns:REGION:ACCOUNT_ID:TOPIC_NAME
   ExcludeCredits:
     Type: String
     Default: "true"
