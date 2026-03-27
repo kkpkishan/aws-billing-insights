@@ -1023,17 +1023,25 @@ Resources:
 
           def get_forecast(ce, end_date_str):
               try:
-                  start = end_date_str
-                  end_dt = datetime.strptime(end_date_str, '%Y-%m-%d').date() + relativedelta(months=1)
+                  # FIXED: Always forecast from 1st of next month to end of next month
+                  # This ensures we get the full month forecast, not partial month
+                  today = datetime.now().date()
+                  next_month_start = (today.replace(day=1) + relativedelta(months=1))
+                  next_month_end = (next_month_start + relativedelta(months=1))
+                  
+                  print(f"[Forecast] Forecasting from {next_month_start.isoformat()} to {next_month_end.isoformat()}")
+                  
                   resp = ce.get_cost_forecast(
-                      TimePeriod={'Start': start, 'End': end_dt.isoformat()},
+                      TimePeriod={'Start': next_month_start.isoformat(), 'End': next_month_end.isoformat()},
                       Metric='UNBLENDED_COST',
                       Granularity='MONTHLY'
                   )
                   total = resp.get('Total', {})
-                  return round(float(total.get('Amount', 0)), 2)
+                  forecast_amount = round(float(total.get('Amount', 0)), 2)
+                  print(f"[Forecast] Next month forecast: ${forecast_amount}")
+                  return forecast_amount
               except Exception as e:
-                  print(f"Forecast error: {e}")
+                  print(f"[Forecast] ERROR: {e}")
                   return None
 
           def get_sp_utilization(ce, start, end):
@@ -1058,27 +1066,66 @@ Resources:
 
           def get_ri_utilization(ce, start, end):
               try:
+                  print(f"[RI Utilization] Fetching data from {start} to {end}")
                   resp = ce.get_reservation_utilization(
                       TimePeriod={'Start': start, 'End': end},
                       Granularity='MONTHLY'
-                      # Removed GroupBy - not supported for RI utilization
                   )
-                  results = []
                   
-                  # Get the total summary
-                  total = resp.get('Total', {}).get('Utilization', {})
-                  summary = {
-                      'total_utilization_pct': round(float(total.get('UtilizationPercentage', 0)), 1),
-                      'total_purchased_hours': round(float(total.get('PurchasedHours', 0)), 1),
-                      'total_used_hours': round(float(total.get('UsedHours', 0)), 1),
-                      'total_unused_hours': round(float(total.get('UnusedHours', 0)), 1),
-                      'total_unused_cost': round(float(total.get('UnusedRecurringFee', 0)), 2)
-                  }
+                  # FIXED: Check both Total and UtilizationsByTime for RI data
+                  # Some accounts return data in UtilizationsByTime array
+                  total = resp.get('Total', {})
+                  utilizations_by_time = resp.get('UtilizationsByTime', [])
+                  
+                  # If Total is empty but UtilizationsByTime has data, aggregate it
+                  if utilizations_by_time and not total.get('Utilization'):
+                      print(f"[RI Utilization] Aggregating {len(utilizations_by_time)} time periods")
+                      total_purchased = 0
+                      total_used = 0
+                      total_unused = 0
+                      total_unused_cost = 0
+                      
+                      for period in utilizations_by_time:
+                          util = period.get('Utilization', {})
+                          total_purchased += float(util.get('PurchasedHours', 0))
+                          total_used += float(util.get('UsedHours', 0))
+                          total_unused += float(util.get('UnusedHours', 0))
+                          total_unused_cost += float(util.get('UnusedRecurringFee', 0))
+                      
+                      # Calculate utilization percentage
+                      util_pct = (total_used / total_purchased * 100) if total_purchased > 0 else 0
+                      
+                      summary = {
+                          'total_utilization_pct': round(util_pct, 1),
+                          'total_purchased_hours': round(total_purchased, 1),
+                          'total_used_hours': round(total_used, 1),
+                          'total_unused_hours': round(total_unused, 1),
+                          'total_unused_cost': round(total_unused_cost, 2)
+                      }
+                  else:
+                      # Use Total directly
+                      util = total.get('Utilization', {})
+                      summary = {
+                          'total_utilization_pct': round(float(util.get('UtilizationPercentage', 0)), 1),
+                          'total_purchased_hours': round(float(util.get('PurchasedHours', 0)), 1),
+                          'total_used_hours': round(float(util.get('UsedHours', 0)), 1),
+                          'total_unused_hours': round(float(util.get('UnusedHours', 0)), 1),
+                          'total_unused_cost': round(float(util.get('UnusedRecurringFee', 0)), 2)
+                      }
                   
                   print(f"[RI Utilization] Overall: {summary['total_utilization_pct']}% utilized, ${summary['total_unused_cost']} wasted")
-                  return {'summary': summary, 'by_instance': results}
+                  print(f"[RI Utilization] Hours: {summary['total_used_hours']}h used / {summary['total_purchased_hours']}h purchased")
+                  
+                  # Return empty dict if no RI data found
+                  if summary['total_purchased_hours'] == 0:
+                      print(f"[RI Utilization] No Reserved Instances found")
+                      return {}
+                  
+                  return {'summary': summary, 'by_instance': []}
               except Exception as e:
                   print(f"[RI Utilization] ERROR: {e}")
+                  import traceback
+                  print(f"[RI Utilization] Traceback: {traceback.format_exc()}")
                   return {}
 
           def compute_insights(cost_data):
@@ -1201,7 +1248,7 @@ Resources:
                   # 2. Cost forecast
                   forecast = None
                   if env_bool('EnableForecast', 'true'):
-                      forecast = get_forecast(ce, end_str_actual)
+                      forecast = get_forecast(ce, None)  # FIXED: Pass None, function calculates dates internally
 
                   # 3. Savings Plans utilization
                   sp_data = []
