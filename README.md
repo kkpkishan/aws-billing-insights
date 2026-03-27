@@ -4,6 +4,8 @@
 
 Automated AWS billing analysis and cost optimization tool powered by Amazon Bedrock LLMs. Get intelligent insights, forecasts, and actionable recommendations delivered directly to your inbox via SNS.
 
+> **📊 [View Sample Report](SAMPLE_REPORT.md)** - See a complete example of the billing insights report with all sections and formatting.
+
 ## Overview
 
 AWS Billing Insights is a serverless solution that analyzes your AWS spending patterns using AI-powered insights from Amazon Bedrock. The system automatically generates comprehensive billing reports with cost forecasts, optimization recommendations, idle resource detection, and budget alerts.
@@ -194,34 +196,54 @@ aws cloudformation create-stack \
 
 ## Report Sections
 
-Generated reports include:
+Generated reports follow a business-friendly structure with 13 sections. **[View complete sample report with dummy data →](SAMPLE_REPORT.md)**
 
-1. **Executive Summary**: High-level overview with key metrics, action items, and cost basis (credits/tax exclusions)
-2. **Cost Summary**: Total spend, monthly breakdown, and trends
-3. **Top 5 Cost Drivers**: Services consuming the most budget
-4. **Month-over-Month Changes**: Services with significant cost variations
-5. **Cost Forecast**: Predicted next-month spending (if enabled)
-6. **Budget Status**: Current spend vs. budget threshold (if configured)
-7. **Savings Plans Utilization**: SP efficiency and unused commitments (if enabled)
-8. **Reserved Instances Utilization**: RI efficiency and wasted capacity (if enabled)
-9. **Cost by Region**: Regional spending breakdown (if enabled)
-10. **Cost by Linked Account**: Multi-account analysis (if enabled)
-11. **Daily Spike Analysis**: Unusual spending patterns (if DAILY granularity)
-12. **Year-over-Year Comparison**: Seasonal trends (if enabled)
-13. **Historical Trends**: 6-month trends with MoM/QoQ growth (if enabled)
-14. **Data Transfer Costs**: Detailed breakdown with service-level and usage-type analysis (if enabled)
-    - Inter-region transfer costs by service and usage type
-    - Inter-AZ transfer costs by service and usage type
-    - Internet egress costs by service and usage type
-    - Data volume in GB for each category
-    - LLM-generated summary explaining causes and optimization recommendations
-15. **Idle Resources**: Detected unused resources with cost impact (if enabled)
-16. **Optimization Recommendations**: Service-specific cost savings (if enabled)
-17. **Compute Rightsizing**: EC2, RDS, Lambda rightsizing with savings calculations (if enabled)
-18. **S3 Storage Optimization**: Lifecycle policies and storage class recommendations (if enabled)
-19. **EBS Optimization**: gp2 to gp3 conversion opportunities with savings (if enabled)
-20. **NAT Gateway Analysis**: Cost breakdown and VPC endpoint recommendations (if enabled)
-21. **Anomalies & Risk Alerts**: Critical issues requiring attention
+### Report Structure
+
+1. **Alert Header**: Critical metrics at the top (account, region, spend, budget status, actions needed)
+2. **Executive Summary**: Answers 5 key questions (spend, trend, budget, top spender, actions)
+3. **Immediate Actions**: 3-5 most urgent actionable items
+4. **Budget Status and Forecast**: Budget vs actual, overspend, next month forecast
+5. **Monthly Spend Trend**: Last 3-4 months with MoM percentages
+6. **Top 5 Cost Drivers**: Services consuming most budget
+7. **Cost Changes and Anomalies**: Combined MoM changes and anomalies
+8. **Commitment Efficiency**: Savings Plans + Reserved Instances together
+9. **Idle Resources and Optimization**: All optimization opportunities grouped
+10. **Data Transfer Analysis**: Transfer costs with recommendations
+11. **Cost by Region**: Regional distribution
+12. **NAT Gateway Analysis**: NAT costs and VPC endpoints
+13. **Detailed Appendix**: All remaining technical details
+
+> **💡 Tip**: The report structure is optimized for business users - critical information first, technical details in the appendix. See [SAMPLE_REPORT.md](SAMPLE_REPORT.md) for formatting examples.
+
+### Included Data (when enabled)
+
+- **Executive Summary**: High-level overview with key metrics, action items, and cost basis (credits/tax exclusions)
+- **Cost Summary**: Total spend, monthly breakdown, and trends
+- **Top 5 Cost Drivers**: Services consuming the most budget
+- **Month-over-Month Changes**: Services with significant cost variations
+- **Cost Forecast**: Predicted next-month spending (if enabled)
+- **Budget Status**: Current spend vs. budget threshold (if configured)
+- **Savings Plans Utilization**: SP efficiency and unused commitments (if enabled)
+- **Reserved Instances Utilization**: RI efficiency, net savings, and wasted capacity (if enabled)
+- **Cost by Region**: Regional spending breakdown (if enabled)
+- **Cost by Linked Account**: Multi-account analysis (if enabled)
+- **Daily Spike Analysis**: Unusual spending patterns (if DAILY granularity)
+- **Year-over-Year Comparison**: Seasonal trends (if enabled)
+- **Historical Trends**: 6-month trends with MoM/QoQ growth (if enabled)
+- **Data Transfer Costs**: Detailed breakdown with service-level and usage-type analysis (if enabled)
+  - Inter-region transfer costs by service and usage type
+  - Inter-AZ transfer costs by service and usage type
+  - Internet egress costs by service and usage type
+  - Data volume in GB for each category
+  - LLM-generated summary explaining causes and optimization recommendations
+- **Idle Resources**: Detected unused resources with cost impact (if enabled)
+- **Optimization Recommendations**: Service-specific cost savings (if enabled)
+- **Compute Rightsizing**: EC2, RDS, Lambda rightsizing with savings calculations (if enabled)
+- **S3 Storage Optimization**: Lifecycle policies and storage class recommendations (if enabled)
+- **EBS Optimization**: gp2 to gp3 conversion opportunities with savings (if enabled)
+- **NAT Gateway Analysis**: Cost breakdown and VPC endpoint recommendations (if enabled)
+- **Anomalies & Risk Alerts**: Critical issues requiring attention
 
 ## IAM Permissions
 
