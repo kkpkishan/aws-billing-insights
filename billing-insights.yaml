@@ -128,6 +128,26 @@ Parameters:
     Default: "true"
     AllowedValues: ["true", "false"]
     Description: Detect idle resources (low CPU EC2, unused EBS, unattached EIPs, old snapshots).
+  EnableComputeRightsizing:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Analyze compute resources (EC2, RDS, Lambda, ECS, ElastiCache) and suggest rightsizing opportunities with cost savings.
+  EnableS3Optimization:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Analyze S3 storage classes and suggest lifecycle policies for cost optimization.
+  EnableEBSOptimization:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Identify gp2 volumes that could be converted to gp3 for cost savings.
+  EnableNATGatewayAnalysis:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Analyze NAT Gateway costs and suggest VPC endpoints for AWS services to reduce data transfer costs.
   ScheduleExpr:
     Type: String
     Default: rate(30 days)
@@ -207,9 +227,22 @@ Resources:
             - s3:ListAllMyBuckets
             - s3:GetBucketLocation
             - s3:GetBucketLifecycleConfiguration
+            - s3:GetBucketTagging
+            - s3:GetBucketVersioning
+            - s3:GetIntelligentTieringConfiguration
+            - s3:ListBucketVersions
             - lambda:ListFunctions
+            - lambda:GetFunction
             - compute-optimizer:GetEC2InstanceRecommendations
             - compute-optimizer:GetEBSVolumeRecommendations
+            - compute-optimizer:GetLambdaFunctionRecommendations
+            - elasticache:DescribeCacheClusters
+            - elasticache:DescribeReplicationGroups
+            - ecs:ListClusters
+            - ecs:ListServices
+            - ecs:DescribeServices
+            - eks:ListClusters
+            - eks:DescribeCluster
             Effect: Allow
             Resource: "*"
           Version: '2012-10-17'
@@ -293,6 +326,14 @@ Resources:
             Ref: EnableDataTransferAnalysis
           EnableIdleResourceDetection:
             Ref: EnableIdleResourceDetection
+          EnableComputeRightsizing:
+            Ref: EnableComputeRightsizing
+          EnableS3Optimization:
+            Ref: EnableS3Optimization
+          EnableEBSOptimization:
+            Ref: EnableEBSOptimization
+          EnableNATGatewayAnalysis:
+            Ref: EnableNATGatewayAnalysis
       Role:
         Fn::GetAtt: LambdaRole.Arn
       ReservedConcurrentExecutions: 1
@@ -657,6 +698,271 @@ Resources:
                   print(f"Service recommendations error: {e}")
                   return []
 
+          def get_compute_rightsizing(region):
+              """Analyze compute resources and suggest rightsizing opportunities"""
+              try:
+                  compute_optimizer = boto3.client('compute-optimizer', region_name=region)
+                  ec2 = boto3.client('ec2', region_name=region)
+                  rds = boto3.client('rds', region_name=region)
+                  lambda_client = boto3.client('lambda', region_name=region)
+                  
+                  rightsizing = {
+                      'ec2': [],
+                      'rds': [],
+                      'lambda': [],
+                      'total_savings': 0
+                  }
+                  
+                  # EC2 Rightsizing using Compute Optimizer
+                  try:
+                      ec2_recs = compute_optimizer.get_ec2_instance_recommendations(maxResults=100)
+                      for rec in ec2_recs.get('instanceRecommendations', []):
+                          current = rec.get('currentInstanceType')
+                          recommended = rec['recommendationOptions'][0] if rec.get('recommendationOptions') else None
+                          if recommended and recommended.get('instanceType') != current:
+                              savings = float(rec.get('finding', {}).get('savingsOpportunity', {}).get('estimatedMonthlySavings', {}).get('value', 0))
+                              rightsizing['ec2'].append({
+                                  'instance_id': rec.get('instanceArn', '').split('/')[-1],
+                                  'current_type': current,
+                                  'recommended_type': recommended.get('instanceType'),
+                                  'monthly_savings': round(savings, 2),
+                                  'reason': rec.get('finding')
+                              })
+                              rightsizing['total_savings'] += savings
+                      print(f"[Rightsizing] Found {len(rightsizing['ec2'])} EC2 rightsizing opportunities")
+                  except Exception as e:
+                      print(f"[Rightsizing] EC2 analysis error: {e}")
+                  
+                  # RDS Rightsizing (basic analysis)
+                  try:
+                      db_instances = rds.describe_db_instances(MaxRecords=20)
+                      cloudwatch = boto3.client('cloudwatch', region_name=region)
+                      for db in db_instances['DBInstances']:
+                          if db['DBInstanceStatus'] == 'available':
+                              db_id = db['DBInstanceIdentifier']
+                              try:
+                                  # Check CPU utilization
+                                  metrics = cloudwatch.get_metric_statistics(
+                                      Namespace='AWS/RDS',
+                                      MetricName='CPUUtilization',
+                                      Dimensions=[{'Name': 'DBInstanceIdentifier', 'Value': db_id}],
+                                      StartTime=datetime.utcnow() - timedelta(days=14),
+                                      EndTime=datetime.utcnow(),
+                                      Period=86400,
+                                      Statistics=['Average', 'Maximum']
+                                  )
+                                  if metrics['Datapoints']:
+                                      avg_cpu = sum(d['Average'] for d in metrics['Datapoints']) / len(metrics['Datapoints'])
+                                      max_cpu = max(d['Maximum'] for d in metrics['Datapoints'])
+                                      if avg_cpu < 20 and max_cpu < 40:
+                                          rightsizing['rds'].append({
+                                              'db_id': db_id,
+                                              'current_class': db['DBInstanceClass'],
+                                              'avg_cpu': round(avg_cpu, 1),
+                                              'max_cpu': round(max_cpu, 1),
+                                              'recommendation': 'Consider downsizing - low CPU utilization'
+                                          })
+                              except Exception:
+                                  pass
+                      print(f"[Rightsizing] Found {len(rightsizing['rds'])} RDS rightsizing opportunities")
+                  except Exception as e:
+                      print(f"[Rightsizing] RDS analysis error: {e}")
+                  
+                  # Lambda Memory Optimization
+                  try:
+                      lambda_recs = compute_optimizer.get_lambda_function_recommendations(maxResults=100)
+                      for rec in lambda_recs.get('lambdaFunctionRecommendations', []):
+                          current_mem = rec.get('currentMemorySize')
+                          recommended = rec['memorySizeRecommendationOptions'][0] if rec.get('memorySizeRecommendationOptions') else None
+                          if recommended and recommended.get('memorySize') != current_mem:
+                              savings = float(rec.get('finding', {}).get('savingsOpportunity', {}).get('estimatedMonthlySavings', {}).get('value', 0))
+                              rightsizing['lambda'].append({
+                                  'function_arn': rec.get('functionArn', '').split(':')[-1],
+                                  'current_memory': current_mem,
+                                  'recommended_memory': recommended.get('memorySize'),
+                                  'monthly_savings': round(savings, 2)
+                              })
+                              rightsizing['total_savings'] += savings
+                      print(f"[Rightsizing] Found {len(rightsizing['lambda'])} Lambda optimization opportunities")
+                  except Exception as e:
+                      print(f"[Rightsizing] Lambda analysis error: {e}")
+                  
+                  rightsizing['total_savings'] = round(rightsizing['total_savings'], 2)
+                  return rightsizing if rightsizing['total_savings'] > 0 or rightsizing['ec2'] or rightsizing['rds'] or rightsizing['lambda'] else {}
+              except Exception as e:
+                  print(f"Compute rightsizing error: {e}")
+                  return {}
+
+          def get_s3_optimization(region):
+              """Analyze S3 storage and suggest optimization opportunities"""
+              try:
+                  s3 = boto3.client('s3')
+                  cloudwatch = boto3.client('cloudwatch', region_name=region)
+                  
+                  s3_opts = {
+                      'buckets_without_lifecycle': [],
+                      'buckets_with_old_objects': [],
+                      'potential_savings': 0
+                  }
+                  
+                  buckets = s3.list_buckets()
+                  for bucket in buckets['Buckets'][:30]:
+                      bucket_name = bucket['Name']
+                      try:
+                          # Check lifecycle policy
+                          has_lifecycle = True
+                          try:
+                              s3.get_bucket_lifecycle_configuration(Bucket=bucket_name)
+                          except s3.exceptions.NoSuchLifecycleConfiguration:
+                              has_lifecycle = False
+                              s3_opts['buckets_without_lifecycle'].append(bucket_name)
+                          
+                          # Get bucket size from CloudWatch
+                          try:
+                              metrics = cloudwatch.get_metric_statistics(
+                                  Namespace='AWS/S3',
+                                  MetricName='BucketSizeBytes',
+                                  Dimensions=[
+                                      {'Name': 'BucketName', 'Value': bucket_name},
+                                      {'Name': 'StorageType', 'Value': 'StandardStorage'}
+                                  ],
+                                  StartTime=datetime.utcnow() - timedelta(days=2),
+                                  EndTime=datetime.utcnow(),
+                                  Period=86400,
+                                  Statistics=['Average']
+                              )
+                              if metrics['Datapoints'] and not has_lifecycle:
+                                  size_bytes = metrics['Datapoints'][0]['Average']
+                                  size_gb = size_bytes / (1024**3)
+                                  if size_gb > 100:
+                                      # Estimate 30% could move to IA (50% cost reduction)
+                                      monthly_cost = size_gb * 0.023  # Standard storage cost
+                                      potential_savings = (size_gb * 0.3) * 0.023 * 0.5
+                                      s3_opts['buckets_with_old_objects'].append({
+                                          'bucket': bucket_name,
+                                          'size_gb': round(size_gb, 2),
+                                          'potential_savings': round(potential_savings, 2)
+                                      })
+                                      s3_opts['potential_savings'] += potential_savings
+                          except Exception:
+                              pass
+                      except Exception:
+                          pass
+                  
+                  s3_opts['potential_savings'] = round(s3_opts['potential_savings'], 2)
+                  print(f"[S3 Optimization] Found {len(s3_opts['buckets_without_lifecycle'])} buckets without lifecycle, potential savings: ${s3_opts['potential_savings']}")
+                  return s3_opts if s3_opts['buckets_without_lifecycle'] or s3_opts['buckets_with_old_objects'] else {}
+              except Exception as e:
+                  print(f"S3 optimization error: {e}")
+                  return {}
+
+          def get_ebs_optimization(region):
+              """Analyze EBS volumes and suggest gp2 to gp3 conversion"""
+              try:
+                  ec2 = boto3.client('ec2', region_name=region)
+                  
+                  ebs_opts = {
+                      'gp2_volumes': [],
+                      'total_savings': 0
+                  }
+                  
+                  volumes = ec2.describe_volumes(
+                      Filters=[{'Name': 'volume-type', 'Values': ['gp2']}],
+                      MaxResults=100
+                  )
+                  
+                  for vol in volumes['Volumes']:
+                      size_gb = vol['Size']
+                      vol_id = vol['VolumeId']
+                      # gp2 costs $0.10/GB/month, gp3 costs $0.08/GB/month (20% savings)
+                      monthly_cost_gp2 = size_gb * 0.10
+                      monthly_cost_gp3 = size_gb * 0.08
+                      monthly_savings = monthly_cost_gp2 - monthly_cost_gp3
+                      
+                      ebs_opts['gp2_volumes'].append({
+                          'volume_id': vol_id,
+                          'size_gb': size_gb,
+                          'current_cost': round(monthly_cost_gp2, 2),
+                          'gp3_cost': round(monthly_cost_gp3, 2),
+                          'monthly_savings': round(monthly_savings, 2),
+                          'state': vol['State']
+                      })
+                      ebs_opts['total_savings'] += monthly_savings
+                  
+                  ebs_opts['total_savings'] = round(ebs_opts['total_savings'], 2)
+                  print(f"[EBS Optimization] Found {len(ebs_opts['gp2_volumes'])} gp2 volumes, potential savings: ${ebs_opts['total_savings']}/month")
+                  return ebs_opts if ebs_opts['gp2_volumes'] else {}
+              except Exception as e:
+                  print(f"EBS optimization error: {e}")
+                  return {}
+
+          def get_nat_gateway_analysis(ce, start, end, region, ce_filter):
+              """Analyze NAT Gateway costs and suggest VPC endpoints"""
+              try:
+                  ec2 = boto3.client('ec2', region_name=region)
+                  
+                  nat_analysis = {
+                      'nat_gateways': [],
+                      'total_cost': 0,
+                      'data_processing_cost': 0,
+                      'vpc_endpoint_recommendations': []
+                  }
+                  
+                  # Get NAT Gateways
+                  nat_gateways = ec2.describe_nat_gateways(
+                      Filters=[{'Name': 'state', 'Values': ['available']}]
+                  )
+                  
+                  for nat in nat_gateways['NatGateways']:
+                      nat_id = nat['NatGatewayId']
+                      subnet_id = nat.get('SubnetId', 'N/A')
+                      
+                      # Get NAT Gateway costs from Cost Explorer
+                      try:
+                          params = {
+                              'TimePeriod': {'Start': start, 'End': end},
+                              'Granularity': 'MONTHLY',
+                              'Metrics': ['UnblendedCost'],
+                              'Filter': {
+                                  'And': [
+                                      {'Dimensions': {'Key': 'SERVICE', 'Values': ['Amazon Elastic Compute Cloud - Compute']}},
+                                      {'Dimensions': {'Key': 'USAGE_TYPE', 'Values': ['NatGateway-Hours', 'NatGateway-Bytes']}}
+                                  ]
+                              }
+                          }
+                          if ce_filter:
+                              params['Filter']['And'].append(ce_filter)
+                          
+                          resp = ce.get_cost_and_usage(**params)
+                          nat_cost = sum(float(r['Total']['UnblendedCost']['Amount']) for r in resp['ResultsByTime'])
+                          
+                          nat_analysis['nat_gateways'].append({
+                              'nat_id': nat_id,
+                              'subnet': subnet_id,
+                              'monthly_cost': round(nat_cost, 2)
+                          })
+                          nat_analysis['total_cost'] += nat_cost
+                      except Exception:
+                          pass
+                  
+                  # Suggest VPC endpoints for common AWS services
+                  if nat_analysis['nat_gateways']:
+                      nat_analysis['vpc_endpoint_recommendations'] = [
+                          'S3 Gateway Endpoint (free)',
+                          'DynamoDB Gateway Endpoint (free)',
+                          'EC2 Interface Endpoint (~$7.30/month)',
+                          'Lambda Interface Endpoint (~$7.30/month)',
+                          'SQS Interface Endpoint (~$7.30/month)',
+                          'SNS Interface Endpoint (~$7.30/month)'
+                      ]
+                  
+                  nat_analysis['total_cost'] = round(nat_analysis['total_cost'], 2)
+                  print(f"[NAT Gateway] Found {len(nat_analysis['nat_gateways'])} NAT Gateways, total cost: ${nat_analysis['total_cost']}")
+                  return nat_analysis if nat_analysis['nat_gateways'] else {}
+              except Exception as e:
+                  print(f"NAT Gateway analysis error: {e}")
+                  return {}
+
           def get_cost_by_service(ce, start, end, granularity, ce_filter):
               params = {
                   'TimePeriod': {'Start': start, 'End': end},
@@ -954,6 +1260,26 @@ Resources:
                   service_recommendations = []
                   if env_bool('EnableServiceRecommendations', 'true'):
                       service_recommendations = get_service_recommendations(ce, start_str, end_str_actual, acct_region)
+
+                  # 11. Compute Rightsizing
+                  compute_rightsizing = {}
+                  if env_bool('EnableComputeRightsizing', 'true'):
+                      compute_rightsizing = get_compute_rightsizing(acct_region)
+
+                  # 12. S3 Optimization
+                  s3_optimization = {}
+                  if env_bool('EnableS3Optimization', 'true'):
+                      s3_optimization = get_s3_optimization(acct_region)
+
+                  # 13. EBS Optimization
+                  ebs_optimization = {}
+                  if env_bool('EnableEBSOptimization', 'true'):
+                      ebs_optimization = get_ebs_optimization(acct_region)
+
+                  # 14. NAT Gateway Analysis
+                  nat_gateway_analysis = {}
+                  if env_bool('EnableNATGatewayAnalysis', 'true'):
+                      nat_gateway_analysis = get_nat_gateway_analysis(ce, start_str, end_str_actual, acct_region, ce_filter)
 
                   # Currency conversion with month-specific historical rates
                   currency = os.environ.get('CurrencyCode', 'USD')
@@ -1262,6 +1588,53 @@ Resources:
                       for i, rec in enumerate(service_recommendations, 1):
                           P.append(f"  {i}. {rec}")
 
+                  if compute_rightsizing:
+                      P.append("")
+                      P.append(f"COMPUTE RIGHTSIZING OPPORTUNITIES (Potential Monthly Savings: {currency}{compute_rightsizing.get('total_savings', 0)}):")
+                      if compute_rightsizing.get('ec2'):
+                          P.append(f"  EC2 Instances ({len(compute_rightsizing['ec2'])} opportunities):")
+                          for inst in compute_rightsizing['ec2'][:10]:
+                              P.append(f"    - {inst['instance_id']}: {inst['current_type']} → {inst['recommended_type']} (Save {currency}{inst['monthly_savings']}/month)")
+                      if compute_rightsizing.get('rds'):
+                          P.append(f"  RDS Instances ({len(compute_rightsizing['rds'])} opportunities):")
+                          for db in compute_rightsizing['rds'][:5]:
+                              P.append(f"    - {db['db_id']}: {db['current_class']} (CPU: {db['avg_cpu']}% avg, {db['max_cpu']}% max) - {db['recommendation']}")
+                      if compute_rightsizing.get('lambda'):
+                          P.append(f"  Lambda Functions ({len(compute_rightsizing['lambda'])} opportunities):")
+                          for fn in compute_rightsizing['lambda'][:10]:
+                              P.append(f"    - {fn['function_arn']}: {fn['current_memory']}MB → {fn['recommended_memory']}MB (Save {currency}{fn['monthly_savings']}/month)")
+
+                  if s3_optimization:
+                      P.append("")
+                      P.append(f"S3 STORAGE OPTIMIZATION (Potential Monthly Savings: {currency}{s3_optimization.get('potential_savings', 0)}):")
+                      if s3_optimization.get('buckets_without_lifecycle'):
+                          P.append(f"  Buckets Without Lifecycle Policies ({len(s3_optimization['buckets_without_lifecycle'])}):")
+                          for bucket in s3_optimization['buckets_without_lifecycle'][:10]:
+                              P.append(f"    - {bucket}")
+                      if s3_optimization.get('buckets_with_old_objects'):
+                          P.append(f"  Buckets With Large Standard Storage (consider IA/Glacier):")
+                          for bucket in s3_optimization['buckets_with_old_objects'][:5]:
+                              P.append(f"    - {bucket['bucket']}: {bucket['size_gb']} GB (Potential savings: {currency}{bucket['potential_savings']}/month)")
+
+                  if ebs_optimization:
+                      P.append("")
+                      P.append(f"EBS VOLUME OPTIMIZATION (Potential Monthly Savings: {currency}{ebs_optimization.get('total_savings', 0)}):")
+                      P.append(f"  gp2 Volumes That Could Be Converted to gp3 ({len(ebs_optimization.get('gp2_volumes', []))}):")
+                      for vol in ebs_optimization.get('gp2_volumes', [])[:10]:
+                          P.append(f"    - {vol['volume_id']}: {vol['size_gb']} GB, {vol['state']} (Save {currency}{vol['monthly_savings']}/month)")
+
+                  if nat_gateway_analysis:
+                      P.append("")
+                      P.append(f"NAT GATEWAY COST ANALYSIS (Total Monthly Cost: {currency}{nat_gateway_analysis.get('total_cost', 0)}):")
+                      if nat_gateway_analysis.get('nat_gateways'):
+                          P.append(f"  Active NAT Gateways ({len(nat_gateway_analysis['nat_gateways'])}):")
+                          for nat in nat_gateway_analysis['nat_gateways']:
+                              P.append(f"    - {nat['nat_id']} (Subnet: {nat['subnet']}): {currency}{nat['monthly_cost']}/month")
+                      if nat_gateway_analysis.get('vpc_endpoint_recommendations'):
+                          P.append("  VPC Endpoint Recommendations to Reduce NAT Gateway Costs:")
+                          for rec in nat_gateway_analysis['vpc_endpoint_recommendations']:
+                              P.append(f"    - {rec}")
+
                   P.append("")
                   P.append("ALL SERVICE TOTALS:")
                   for svc, total in insights['all_svcs'].items():
@@ -1282,6 +1655,10 @@ Resources:
                   if data_transfer: P.append("Include section: DATA TRANSFER COSTS with detailed breakdown by service and usage type. Add a brief summary explaining what's causing the data transfer costs and recommendations to reduce them (e.g., use VPC endpoints, optimize cross-region traffic, review inter-AZ communication patterns).")
                   if idle_resources: P.append("Include section: IDLE RESOURCES (list all detected idle/unused resources with cost impact).")
                   if service_recommendations: P.append("Include section: OPTIMIZATION RECOMMENDATIONS (service-specific cost savings opportunities).")
+                  if compute_rightsizing: P.append("Include section: COMPUTE RIGHTSIZING with detailed EC2, RDS, and Lambda recommendations. Explain the savings potential and implementation steps.")
+                  if s3_optimization: P.append("Include section: S3 STORAGE OPTIMIZATION with lifecycle policy recommendations and storage class suggestions.")
+                  if ebs_optimization: P.append("Include section: EBS OPTIMIZATION explaining gp2 to gp3 conversion benefits and savings.")
+                  if nat_gateway_analysis: P.append("Include section: NAT GATEWAY ANALYSIS with VPC endpoint recommendations to reduce costs.")
                   if currency_enabled and current_rate_info: 
                       P.append(f"IMPORTANT: All costs converted from USD to {currency} using month-specific exchange rates.")
                       P.append(f"Each month's costs use the exchange rate from the 1st day of that month (shown in brackets).")

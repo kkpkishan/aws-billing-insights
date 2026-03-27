@@ -25,6 +25,27 @@ AWS Billing Insights is a serverless solution that analyzes your AWS spending pa
   - Old snapshots (>90 days)
   - Idle RDS instances (<1 average connection)
 
+- **Compute Rightsizing** (NEW):
+  - EC2 instance rightsizing with AWS Compute Optimizer
+  - RDS instance downsizing based on CPU utilization
+  - Lambda memory optimization recommendations
+  - Monthly savings calculations for each recommendation
+
+- **S3 Storage Optimization** (NEW):
+  - Identify buckets without lifecycle policies
+  - Suggest storage class transitions (Standard → IA → Glacier)
+  - Calculate potential savings from storage optimization
+
+- **EBS Volume Optimization** (NEW):
+  - Identify gp2 volumes that can be converted to gp3
+  - Calculate 20% cost savings from gp2 → gp3 conversion
+  - Show per-volume and total monthly savings
+
+- **NAT Gateway Cost Analysis** (NEW):
+  - Analyze NAT Gateway costs and data processing charges
+  - Recommend VPC endpoints for AWS services (S3, DynamoDB, etc.)
+  - Calculate potential savings from VPC endpoint adoption
+
 - **Service-Specific Recommendations**:
   - Stopped EC2 instances with ongoing EBS costs
   - S3 buckets without lifecycle policies
@@ -140,6 +161,10 @@ aws cloudformation create-stack \
 | `EnableHistoricalTrends` | 6-month trend analysis | `true` |
 | `EnableDataTransferAnalysis` | Data transfer breakdown | `true` |
 | `EnableIdleResourceDetection` | Idle resource scanning | `true` |
+| `EnableComputeRightsizing` | Compute rightsizing recommendations | `true` |
+| `EnableS3Optimization` | S3 storage optimization | `true` |
+| `EnableEBSOptimization` | EBS gp2→gp3 conversion | `true` |
+| `EnableNATGatewayAnalysis` | NAT Gateway cost analysis | `true` |
 
 ### Schedule Options
 
@@ -192,7 +217,11 @@ Generated reports include:
     - LLM-generated summary explaining causes and optimization recommendations
 15. **Idle Resources**: Detected unused resources with cost impact (if enabled)
 16. **Optimization Recommendations**: Service-specific cost savings (if enabled)
-17. **Anomalies & Risk Alerts**: Critical issues requiring attention
+17. **Compute Rightsizing**: EC2, RDS, Lambda rightsizing with savings calculations (if enabled)
+18. **S3 Storage Optimization**: Lifecycle policies and storage class recommendations (if enabled)
+19. **EBS Optimization**: gp2 to gp3 conversion opportunities with savings (if enabled)
+20. **NAT Gateway Analysis**: Cost breakdown and VPC endpoint recommendations (if enabled)
+21. **Anomalies & Risk Alerts**: Critical issues requiring attention
 
 ## IAM Permissions
 
@@ -204,9 +233,12 @@ The Lambda function requires the following permissions:
 - **EC2**: `ec2:DescribeInstances`, `ec2:DescribeVolumes`, `ec2:DescribeAddresses`, `ec2:DescribeSnapshots`, `ec2:DescribeNatGateways`
 - **CloudWatch**: `cloudwatch:GetMetricStatistics`
 - **RDS**: `rds:DescribeDBInstances`, `rds:DescribeDBClusters`
-- **S3**: `s3:ListAllMyBuckets`, `s3:GetBucketLocation`, `s3:GetBucketLifecycleConfiguration`
+- **S3**: `s3:ListAllMyBuckets`, `s3:GetBucketLocation`, `s3:GetBucketLifecycleConfiguration`, `s3:GetBucketTagging`, `s3:GetBucketVersioning`, `s3:GetIntelligentTieringConfiguration`, `s3:ListBucketVersions`
+- **Lambda**: `lambda:ListFunctions`, `lambda:GetFunction`
 - **Organizations**: `organizations:ListAccounts` (for linked accounts)
-- **Compute Optimizer**: `compute-optimizer:GetEC2InstanceRecommendations`, `compute-optimizer:GetEBSVolumeRecommendations`
+- **Compute Optimizer**: `compute-optimizer:GetEC2InstanceRecommendations`, `compute-optimizer:GetEBSVolumeRecommendations`, `compute-optimizer:GetLambdaFunctionRecommendations`
+- **ElastiCache**: `elasticache:DescribeCacheClusters`, `elasticache:DescribeReplicationGroups`
+- **ECS/EKS**: `ecs:ListClusters`, `ecs:ListServices`, `ecs:DescribeServices`, `eks:ListClusters`, `eks:DescribeCluster`
 
 ## Cost Considerations
 
