@@ -111,6 +111,7 @@ aws cloudformation create-stack \
 |-----------|-------------|---------|
 | `Region` | AWS Region for deployment | `ap-south-1` |
 | `ModelId` | Bedrock LLM model | `openai.gpt-oss-120b-1:0` |
+| `AccountName` | Friendly account name (optional) | `""` |
 | `ScheduleExpr` | Execution schedule | `rate(30 days)` |
 | `MonthlyBudget` | Budget threshold (0=disabled) | `0` |
 | `Granularity` | Cost data granularity | `MONTHLY` |
@@ -121,7 +122,7 @@ aws cloudformation create-stack \
 |-----------|-------------|---------|
 | `ExcludeCredits` | Exclude AWS credits | `true` |
 | `ExcludeTax` | Exclude tax charges | `true` |
-| `CurrencyCode` | Report currency | `USD` |
+| `CurrencyCode` | Report currency (Disabled/USD/EUR/GBP/JPY/CNY/INR/AUD/CAD) | `Disabled` |
 
 ### Feature Toggles
 
@@ -157,15 +158,20 @@ aws cloudformation create-stack \
 
 ### Supported Currencies
 
-`USD`, `EUR`, `GBP`, `JPY`, `CNY`, `INR`, `AUD`, `CAD`
+`Disabled` (default), `USD`, `EUR`, `GBP`, `JPY`, `CNY`, `INR`, `AUD`, `CAD`
 
-Currency conversion uses historical exchange rates from Frankfurter API (European Central Bank data) with month-specific rates for accurate historical cost reporting.
+**Currency Conversion Features:**
+- Set to `Disabled` to skip currency conversion and report in USD only (no exchange rate information)
+- When enabled, uses historical exchange rates from Frankfurter API (European Central Bank data)
+- Month-specific rates applied for accurate historical cost reporting
+- Each month's costs converted using the exchange rate from the 1st day of that month
+- Forecast and current month use the latest available exchange rate
 
 ## Report Sections
 
 Generated reports include:
 
-1. **Executive Summary**: High-level overview with key metrics and action items
+1. **Executive Summary**: High-level overview with key metrics, action items, and cost basis (credits/tax exclusions)
 2. **Cost Summary**: Total spend, monthly breakdown, and trends
 3. **Top 5 Cost Drivers**: Services consuming the most budget
 4. **Month-over-Month Changes**: Services with significant cost variations
@@ -178,7 +184,12 @@ Generated reports include:
 11. **Daily Spike Analysis**: Unusual spending patterns (if DAILY granularity)
 12. **Year-over-Year Comparison**: Seasonal trends (if enabled)
 13. **Historical Trends**: 6-month trends with MoM/QoQ growth (if enabled)
-14. **Data Transfer Costs**: Inter-region, inter-AZ, egress breakdown (if enabled)
+14. **Data Transfer Costs**: Detailed breakdown with service-level and usage-type analysis (if enabled)
+    - Inter-region transfer costs by service and usage type
+    - Inter-AZ transfer costs by service and usage type
+    - Internet egress costs by service and usage type
+    - Data volume in GB for each category
+    - LLM-generated summary explaining causes and optimization recommendations
 15. **Idle Resources**: Detected unused resources with cost impact (if enabled)
 16. **Optimization Recommendations**: Service-specific cost savings (if enabled)
 17. **Anomalies & Risk Alerts**: Critical issues requiring attention

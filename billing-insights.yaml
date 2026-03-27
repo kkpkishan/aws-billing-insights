@@ -109,11 +109,15 @@ Parameters:
     Default: "true"
     AllowedValues: ["true", "false"]
     Description: Show 6-month historical trends and growth rate analysis (MoM, QoQ).
+  AccountName:
+    Type: String
+    Default: ""
+    Description: Optional friendly name for this AWS account (e.g., "Production", "Development"). Will be displayed in SNS email subject and report. Leave empty to use Account ID only.
   CurrencyCode:
     Type: String
-    Default: USD
-    AllowedValues: ["USD", "EUR", "GBP", "JPY", "CNY", "INR", "AUD", "CAD"]
-    Description: Currency for cost reporting. Note - AWS Cost Explorer returns USD, conversion is informational only.
+    Default: Disabled
+    AllowedValues: ["Disabled", "USD", "EUR", "GBP", "JPY", "CNY", "INR", "AUD", "CAD"]
+    Description: Currency for cost reporting. Set to "Disabled" to skip currency conversion and report in USD only. Note - AWS Cost Explorer returns USD, conversion is informational only.
   EnableDataTransferAnalysis:
     Type: String
     Default: "true"
@@ -253,6 +257,8 @@ Resources:
             Ref: snsTopicArn
           ModelId:
             Ref: ModelId
+          AccountName:
+            Ref: AccountName
           ExcludeCredits:
             Ref: ExcludeCredits
           ExcludeTax:
@@ -400,35 +406,85 @@ Resources:
                   return {}
 
           def get_data_transfer_costs(ce, start, end, ce_filter):
-              """Analyze data transfer costs"""
+              """Analyze data transfer costs with service-level and usage-type breakdown"""
               try:
+                  # Get data transfer costs by SERVICE and USAGE_TYPE
                   params = {
                       'TimePeriod': {'Start': start, 'End': end},
                       'Granularity': 'MONTHLY',
-                      'Metrics': ['UnblendedCost'],
-                      'GroupBy': [{'Type': 'DIMENSION', 'Key': 'USAGE_TYPE'}]
+                      'Metrics': ['UnblendedCost', 'UsageQuantity'],
+                      'GroupBy': [
+                          {'Type': 'DIMENSION', 'Key': 'SERVICE'},
+                          {'Type': 'DIMENSION', 'Key': 'USAGE_TYPE'}
+                      ]
                   }
                   if ce_filter:
                       params['Filter'] = ce_filter
                   resp = ce.get_cost_and_usage(**params)
                   
-                  transfer_costs = {'inter_region': 0, 'inter_az': 0, 'internet_egress': 0}
+                  transfer_data = {
+                      'inter_region': {'total': 0, 'services': defaultdict(lambda: {'total': 0, 'usage_types': []}), 'usage_gb': 0},
+                      'inter_az': {'total': 0, 'services': defaultdict(lambda: {'total': 0, 'usage_types': []}), 'usage_gb': 0},
+                      'internet_egress': {'total': 0, 'services': defaultdict(lambda: {'total': 0, 'usage_types': []}), 'usage_gb': 0}
+                  }
+                  
                   for r in resp['ResultsByTime']:
                       for g in r['Groups']:
-                          usage_type = g['Keys'][0]
-                          cost = float(g['Metrics']['UnblendedCost']['Amount'])
-                          
-                          if 'DataTransfer-Regional' in usage_type:
-                              transfer_costs['inter_region'] += cost
-                          elif 'DataTransfer-In' in usage_type or 'DataTransfer-Out' in usage_type:
-                              transfer_costs['inter_az'] += cost
-                          elif 'DataTransfer' in usage_type or 'Egress' in usage_type:
-                              transfer_costs['internet_egress'] += cost
+                          if len(g['Keys']) >= 2:
+                              service = g['Keys'][0]
+                              usage_type = g['Keys'][1]
+                              cost = float(g['Metrics']['UnblendedCost']['Amount'])
+                              usage_qty = float(g['Metrics']['UsageQuantity']['Amount'])
+                              
+                              if cost < 0.01:
+                                  continue
+                              
+                              # Categorize data transfer types
+                              category = None
+                              if 'DataTransfer-Regional' in usage_type or 'DataTransfer-Region' in usage_type:
+                                  category = 'inter_region'
+                              elif 'DataTransfer-In-Bytes' in usage_type or 'DataTransfer-Out-Bytes' in usage_type:
+                                  category = 'inter_az'
+                              elif 'DataTransfer' in usage_type or 'Egress' in usage_type or 'DataOut' in usage_type:
+                                  category = 'internet_egress'
+                              
+                              if category:
+                                  transfer_data[category]['total'] += cost
+                                  transfer_data[category]['services'][service]['total'] += cost
+                                  transfer_data[category]['services'][service]['usage_types'].append({
+                                      'type': usage_type,
+                                      'cost': round(cost, 2),
+                                      'usage_gb': round(usage_qty, 2)
+                                  })
+                                  transfer_data[category]['usage_gb'] += usage_qty
                   
-                  return {k: round(v, 2) for k, v in transfer_costs.items() if v > 0.01}
+                  # Format results with service and usage type breakdown
+                  result = {}
+                  for category, data in transfer_data.items():
+                      if data['total'] > 0.01:
+                          # Sort services by cost descending
+                          services_list = []
+                          for service, svc_data in sorted(data['services'].items(), key=lambda x: x[1]['total'], reverse=True)[:5]:
+                              # Sort usage types by cost descending
+                              usage_types_sorted = sorted(svc_data['usage_types'], key=lambda x: x['cost'], reverse=True)[:10]
+                              services_list.append({
+                                  'service': service,
+                                  'total': round(svc_data['total'], 2),
+                                  'usage_types': usage_types_sorted
+                              })
+                          
+                          result[category] = {
+                              'total': round(data['total'], 2),
+                              'usage_gb': round(data['usage_gb'], 2),
+                              'services': services_list
+                          }
+                  
+                  return result
               except Exception as e:
                   print(f"Data transfer analysis error: {e}")
                   return {}
+
+
 
           def detect_idle_resources(region):
               """Detect idle and unused resources"""
@@ -771,6 +827,7 @@ Resources:
                   TargetSNSArn = os.environ["TargetArn"]
                   month_delta = int(os.environ["Months"])
                   raw_model = os.environ["ModelId"]
+                  account_name = os.environ.get("AccountName", "").strip()
                   granularity = os.environ.get('Granularity', 'MONTHLY')
                   budget = float(os.environ.get('MonthlyBudget', '0'))
 
@@ -901,27 +958,37 @@ Resources:
                   # Currency conversion with month-specific historical rates
                   currency = os.environ.get('CurrencyCode', 'USD')
                   
-                  print(f"[Currency] Target currency: {currency}")
+                  # Check if currency conversion is disabled
+                  currency_enabled = currency != 'Disabled' and currency != 'USD'
+                  
+                  if currency_enabled:
+                      print(f"[Currency] Target currency: {currency}")
+                  else:
+                      print(f"[Currency] Currency conversion disabled, using USD")
+                      currency = 'USD'  # Set to USD for display
                   
                   # Fetch current currency rate (for forecast and current month)
-                  current_rate_info = get_currency_rates(currency)
-                  
-                  # Fetch historical rates for EACH month in the report (1st day of each month)
+                  current_rate_info = None
                   historical_rates = {}
-                  if currency != 'USD' and current_rate_info:
-                      print(f"[Currency] Fetching historical exchange rates for {currency}...")
-                      for month_data in insights['monthly_summary']:
-                          month_str = month_data['month']  # Format: YYYY-MM-DD (always 1st of month)
-                          rate_info = get_currency_rates(currency, month_str)
-                          if rate_info:
-                              historical_rates[month_str] = rate_info
-                          else:
-                              # Fallback to current rate if historical rate unavailable
-                              historical_rates[month_str] = current_rate_info
-                              print(f"[Currency] Using current rate for {month_str} (historical unavailable)")
+                  
+                  if currency_enabled:
+                      current_rate_info = get_currency_rates(currency)
+                  
+                      # Fetch historical rates for EACH month in the report (1st day of each month)
+                      if current_rate_info:
+                          print(f"[Currency] Fetching historical exchange rates for {currency}...")
+                          for month_data in insights['monthly_summary']:
+                              month_str = month_data['month']  # Format: YYYY-MM-DD (always 1st of month)
+                              rate_info = get_currency_rates(currency, month_str)
+                              if rate_info:
+                                  historical_rates[month_str] = rate_info
+                              else:
+                                  # Fallback to current rate if historical rate unavailable
+                                  historical_rates[month_str] = current_rate_info
+                                  print(f"[Currency] Using current rate for {month_str} (historical unavailable)")
                   
                   # Convert ALL costs from USD to target currency using appropriate rates
-                  if currency != 'USD' and current_rate_info:
+                  if currency_enabled and current_rate_info:
                       print(f"[Currency] Converting all costs from USD to {currency}...")
                       
                       # Convert grand total (use average of all monthly rates for accuracy)
@@ -980,7 +1047,15 @@ Resources:
                       
                       # Convert data transfer costs (use average rate)
                       if data_transfer:
-                          data_transfer = {k: convert_currency(v, currency, avg_rate_info) for k, v in data_transfer.items()}
+                          for category, data in data_transfer.items():
+                              if isinstance(data, dict) and 'total' in data:
+                                  data['total'] = convert_currency(data['total'], currency, avg_rate_info)
+                                  if 'services' in data:
+                                      for svc in data['services']:
+                                          svc['total'] = convert_currency(svc['total'], currency, avg_rate_info)
+                                          if 'usage_types' in svc:
+                                              for ut in svc['usage_types']:
+                                                  ut['cost'] = convert_currency(ut['cost'], currency, avg_rate_info)
                       
                       # Convert daily spikes data if present
                       if daily_spikes_info:
@@ -1017,13 +1092,17 @@ Resources:
 
                   # Build prompt with all pre-computed data
                   P = []
-                  P.append(f"Billing insights for AWS account {account_id}, region {acct_region}.")
+                  # Add account name if provided
+                  if account_name:
+                      P.append(f"Billing insights for AWS account {account_id} ({account_name}), region {acct_region}.")
+                  else:
+                      P.append(f"Billing insights for AWS account {account_id}, region {acct_region}.")
                   if include_current:
                       P.append(f"Period: {start_str} to {end_str_actual} ({month_delta} complete months + current month-to-date). Grand total: {currency}{insights['grand_total']}")
                   else:
                       P.append(f"Period: {start_str} to {end_str_actual} ({month_delta} months). Grand total: {currency}{insights['grand_total']}")
                   
-                  if currency != 'USD' and current_rate_info:
+                  if currency_enabled and current_rate_info:
                       P.append(f"Currency: {currency} (Rate: 1 USD = {current_rate_info['rate']} {currency} as of {current_rate_info['date']}, Source: {current_rate_info['source']})")
                       if historical_rates:
                           P.append("Historical rates used for each month's conversion (month-specific rates applied).")
@@ -1034,7 +1113,7 @@ Resources:
                   for ms in insights['monthly_summary']:
                       line = f"  {ms['month']}: {currency}{ms['spend']}"
                       if 'mom_pct' in ms: line += f" (MoM: {ms['mom_pct']}%)"
-                      if currency != 'USD' and 'exchange_rate' in ms:
+                      if currency_enabled and 'exchange_rate' in ms:
                           line += f" [Rate: 1 USD = {ms['exchange_rate']} {currency} on {ms['rate_date']}]"
                       P.append(line)
 
@@ -1125,12 +1204,38 @@ Resources:
                   if data_transfer:
                       P.append("")
                       P.append("DATA TRANSFER COSTS:")
+                      total_transfer = 0
                       if data_transfer.get('inter_region'):
-                          P.append(f"  Inter-Region Transfer: {currency}{data_transfer['inter_region']}")
+                          dt = data_transfer['inter_region']
+                          total_transfer += dt['total']
+                          P.append(f"  Inter-Region Transfer: {currency}{dt['total']} ({dt['usage_gb']} GB)")
+                          if dt.get('services'):
+                              for svc in dt['services']:
+                                  P.append(f"    {svc['service']}: {currency}{svc['total']}")
+                                  for ut in svc.get('usage_types', [])[:5]:
+                                      P.append(f"      - {ut['type']}: {currency}{ut['cost']} ({ut['usage_gb']} GB)")
                       if data_transfer.get('inter_az'):
-                          P.append(f"  Inter-AZ Transfer: {currency}{data_transfer['inter_az']}")
+                          dt = data_transfer['inter_az']
+                          total_transfer += dt['total']
+                          P.append(f"  Inter-AZ Transfer: {currency}{dt['total']} ({dt['usage_gb']} GB)")
+                          if dt.get('services'):
+                              for svc in dt['services']:
+                                  P.append(f"    {svc['service']}: {currency}{svc['total']}")
+                                  for ut in svc.get('usage_types', [])[:5]:
+                                      P.append(f"      - {ut['type']}: {currency}{ut['cost']} ({ut['usage_gb']} GB)")
                       if data_transfer.get('internet_egress'):
-                          P.append(f"  Internet Egress: {currency}{data_transfer['internet_egress']}")
+                          dt = data_transfer['internet_egress']
+                          total_transfer += dt['total']
+                          P.append(f"  Internet Egress: {currency}{dt['total']} ({dt['usage_gb']} GB)")
+                          if dt.get('services'):
+                              for svc in dt['services']:
+                                  P.append(f"    {svc['service']}: {currency}{svc['total']}")
+                                  for ut in svc.get('usage_types', [])[:5]:
+                                      P.append(f"      - {ut['type']}: {currency}{ut['cost']} ({ut['usage_gb']} GB)")
+                      if total_transfer > 0:
+                          P.append(f"  TOTAL DATA TRANSFER COSTS: {currency}{round(total_transfer, 2)}")
+
+
 
                   if idle_resources:
                       P.append("")
@@ -1174,10 +1279,10 @@ Resources:
                   if daily_spikes_info: P.append("Include section: DAILY SPIKE ANALYSIS (highlight the most expensive days and any spikes above 2x average).")
                   if yoy_data: P.append("Include section: YEAR-OVER-YEAR COMPARISON.")
                   if historical_trends: P.append("Include section: HISTORICAL TRENDS (6-month trends, MoM and QoQ growth rates).")
-                  if data_transfer: P.append("Include section: DATA TRANSFER COSTS (inter-region, inter-AZ, internet egress breakdown).")
+                  if data_transfer: P.append("Include section: DATA TRANSFER COSTS with detailed breakdown by service and usage type. Add a brief summary explaining what's causing the data transfer costs and recommendations to reduce them (e.g., use VPC endpoints, optimize cross-region traffic, review inter-AZ communication patterns).")
                   if idle_resources: P.append("Include section: IDLE RESOURCES (list all detected idle/unused resources with cost impact).")
                   if service_recommendations: P.append("Include section: OPTIMIZATION RECOMMENDATIONS (service-specific cost savings opportunities).")
-                  if currency != 'USD' and current_rate_info: 
+                  if currency_enabled and current_rate_info: 
                       P.append(f"IMPORTANT: All costs converted from USD to {currency} using month-specific exchange rates.")
                       P.append(f"Each month's costs use the exchange rate from the 1st day of that month (shown in brackets).")
                       P.append(f"Current/forecast rate: 1 USD = {current_rate_info['rate']} {currency} (as of {current_rate_info['date']}).")
@@ -1214,20 +1319,38 @@ Resources:
                       result = re.sub(r'\n{3,}', '\n\n', result).strip()
 
                       labels = []
-                      if env_bool('ExcludeCredits', 'true'): labels.append("excl. credits")
-                      if env_bool('ExcludeTax', 'true'): labels.append("excl. tax")
-                      lbl = ", ".join(labels) if labels else "gross"
-                      subj = f'AWS Billing Insights - Account: {account_id}, Region: {acct_region} ({lbl})'
+                      if env_bool('ExcludeCredits', 'true'): labels.append("excluding AWS credits")
+                      if env_bool('ExcludeTax', 'true'): labels.append("excluding tax")
+                      lbl = ", ".join(labels) if labels else "including all charges"
+                      # Build subject line with account name if provided (SNS subject max 100 chars)
+                      # Keep subject short - move labels to report body
+                      if account_name:
+                          subj = f'AWS Billing Insights - {account_name} ({account_id})'
+                      else:
+                          subj = f'AWS Billing Insights - Account {account_id}'
+                      # Ensure subject is under 100 characters for SNS
+                      if len(subj) > 100:
+                          subj = subj[:97] + '...'
 
                       # Build executive summary (pure Python, no LLM)
                       S = []
                       S.append("=" * 60)
                       S.append("EXECUTIVE SUMMARY")
                       S.append("=" * 60)
-                      if include_current:
-                          S.append(f"Account: {account_id}  |  Region: {acct_region}  |  Period: {start_str} to {end_str_actual} (incl. current month MTD)")
+                      # Add account name if provided
+                      if account_name:
+                          if include_current:
+                              S.append(f"Account: {account_id} ({account_name})  |  Region: {acct_region}  |  Period: {start_str} to {end_str_actual} (incl. current month MTD)")
+                          else:
+                              S.append(f"Account: {account_id} ({account_name})  |  Region: {acct_region}  |  Period: {start_str} to {end_str_actual}")
                       else:
-                          S.append(f"Account: {account_id}  |  Region: {acct_region}  |  Period: {start_str} to {end_str_actual}")
+                          if include_current:
+                              S.append(f"Account: {account_id}  |  Region: {acct_region}  |  Period: {start_str} to {end_str_actual} (incl. current month MTD)")
+                          else:
+                              S.append(f"Account: {account_id}  |  Region: {acct_region}  |  Period: {start_str} to {end_str_actual}")
+                      # Add cost exclusion labels
+                      if lbl:
+                          S.append(f"Cost Basis: {lbl}")
                       S.append("")
 
                       # Overall spend + trend
@@ -1301,8 +1424,8 @@ Resources:
                       else:
                           S.append("STATUS: No critical issues. Review details below for optimization opportunities.")
 
-                      # Add currency note if not USD
-                      if currency != 'USD' and current_rate_info:
+                      # Add currency note if conversion is enabled
+                      if currency_enabled and current_rate_info:
                           S.append("")
                           S.append(f"CURRENCY CONVERSION: USD to {currency}")
                           S.append(f"Method: Month-specific exchange rates (1st day of each month)")
