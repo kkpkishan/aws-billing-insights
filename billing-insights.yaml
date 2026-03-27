@@ -1093,11 +1093,36 @@ Resources:
                   total = resp.get('Total', {})
                   utilizations_by_time = resp.get('UtilizationsByTime', [])
                   
-                  print(f"[RI Utilization] Total object: {json.dumps(total, default=str)}")
+                  print(f"[RI Utilization] Total object: {json.dumps(total, default=str)[:500]}")
                   print(f"[RI Utilization] UtilizationsByTime count: {len(utilizations_by_time)}")
                   
-                  # If Total is empty but UtilizationsByTime has data, aggregate it
-                  if utilizations_by_time and not total.get('Utilization'):
+                  # FIXED: Check if Total has data directly (not nested under 'Utilization')
+                  # AWS returns data in Total object directly, not nested
+                  if total and total.get('PurchasedHours'):
+                      # Use Total directly - data is at top level
+                      print(f"[RI Utilization] Using Total object (data at top level)")
+                      summary = {
+                          'total_utilization_pct': round(float(total.get('UtilizationPercentage', 0)), 1),
+                          'total_purchased_hours': round(float(total.get('PurchasedHours', 0)), 1),
+                          'total_used_hours': round(float(total.get('TotalActualHours', 0)), 1),
+                          'total_unused_hours': round(float(total.get('UnusedHours', 0)), 1),
+                          'total_unused_cost': round(float(total.get('RICostForUnusedHours', 0)), 2),
+                          'net_savings': round(float(total.get('NetRISavings', 0)), 2),
+                          'realized_savings': round(float(total.get('RealizedSavings', 0)), 2)
+                      }
+                  elif total and total.get('Utilization'):
+                      # Data is nested under Utilization key
+                      print(f"[RI Utilization] Using Total.Utilization (nested data)")
+                      util = total.get('Utilization', {})
+                      summary = {
+                          'total_utilization_pct': round(float(util.get('UtilizationPercentage', 0)), 1),
+                          'total_purchased_hours': round(float(util.get('PurchasedHours', 0)), 1),
+                          'total_used_hours': round(float(util.get('UsedHours', 0)), 1),
+                          'total_unused_hours': round(float(util.get('UnusedHours', 0)), 1),
+                          'total_unused_cost': round(float(util.get('UnusedRecurringFee', 0)), 2)
+                      }
+                  elif utilizations_by_time:
+                      # Aggregate from UtilizationsByTime array
                       print(f"[RI Utilization] Aggregating {len(utilizations_by_time)} time periods")
                       total_purchased = 0
                       total_used = 0
@@ -1105,13 +1130,23 @@ Resources:
                       total_unused_cost = 0
                       
                       for idx, period in enumerate(utilizations_by_time):
-                          util = period.get('Utilization', {})
-                          period_start = period.get('TimePeriod', {}).get('Start', 'unknown')
-                          purchased = float(util.get('PurchasedHours', 0))
-                          used = float(util.get('UsedHours', 0))
-                          unused = float(util.get('UnusedHours', 0))
-                          unused_cost = float(util.get('UnusedRecurringFee', 0))
+                          # Check if data is at period.Total level or period.Total.Utilization level
+                          period_total = period.get('Total', {})
+                          if period_total.get('PurchasedHours'):
+                              # Data at Total level
+                              purchased = float(period_total.get('PurchasedHours', 0))
+                              used = float(period_total.get('TotalActualHours', 0))
+                              unused = float(period_total.get('UnusedHours', 0))
+                              unused_cost = float(period_total.get('RICostForUnusedHours', 0))
+                          else:
+                              # Data nested under Utilization
+                              util = period_total.get('Utilization', {})
+                              purchased = float(util.get('PurchasedHours', 0))
+                              used = float(util.get('UsedHours', 0))
+                              unused = float(util.get('UnusedHours', 0))
+                              unused_cost = float(util.get('UnusedRecurringFee', 0))
                           
+                          period_start = period.get('TimePeriod', {}).get('Start', 'unknown')
                           print(f"[RI Utilization] Period {idx} ({period_start}): Purchased={purchased}h, Used={used}h, Unused={unused}h, Cost=${unused_cost}")
                           
                           total_purchased += purchased
@@ -1130,15 +1165,9 @@ Resources:
                           'total_unused_cost': round(total_unused_cost, 2)
                       }
                   else:
-                      # Use Total directly
-                      util = total.get('Utilization', {})
-                      summary = {
-                          'total_utilization_pct': round(float(util.get('UtilizationPercentage', 0)), 1),
-                          'total_purchased_hours': round(float(util.get('PurchasedHours', 0)), 1),
-                          'total_used_hours': round(float(util.get('UsedHours', 0)), 1),
-                          'total_unused_hours': round(float(util.get('UnusedHours', 0)), 1),
-                          'total_unused_cost': round(float(util.get('UnusedRecurringFee', 0)), 2)
-                      }
+                      # No data found
+                      print(f"[RI Utilization] No RI data in response")
+                      return {}
                   
                   print(f"[RI Utilization] Overall: {summary['total_utilization_pct']}% utilized, ${summary['total_unused_cost']} wasted")
                   print(f"[RI Utilization] Hours: {summary['total_used_hours']}h used / {summary['total_purchased_hours']}h purchased")
@@ -1568,6 +1597,11 @@ Resources:
                       P.append("")
                       P.append("RESERVED INSTANCES UTILIZATION:")
                       P.append(f"  Overall: {s['total_utilization_pct']}% utilized, {s['total_purchased_hours']}h purchased, {s['total_used_hours']}h used, {s['total_unused_hours']}h unused, {currency}{s['total_unused_cost']} wasted")
+                      # Add savings information if available
+                      if s.get('net_savings'):
+                          P.append(f"  Net RI Savings: {currency}{s['net_savings']}")
+                      if s.get('realized_savings'):
+                          P.append(f"  Realized Savings: {currency}{s['realized_savings']}")
                       for item in ri_data.get('by_instance', []):
                           if item['utilization_pct'] < 100:
                               P.append(f"  {item['instance_type']} ({item['period']}): {item['utilization_pct']}% utilized, {item['unused_hours']}h unused, ${item['unused_cost']} wasted")
@@ -1846,7 +1880,10 @@ Resources:
                       # RI utilization one-liner
                       if ri_data and ri_data.get('summary'):
                           rs = ri_data['summary']
-                          S.append(f"Reserved Instances: {rs['total_utilization_pct']}% utilized, {rs['total_unused_hours']}h unused, {currency}{rs['total_unused_cost']} wasted")
+                          ri_line = f"Reserved Instances: {rs['total_utilization_pct']}% utilized, {rs['total_unused_hours']}h unused"
+                          if rs.get('net_savings'):
+                              ri_line += f", {currency}{rs['net_savings']} net savings"
+                          S.append(ri_line)
 
                       # Top spender
                       if insights['top5']:
