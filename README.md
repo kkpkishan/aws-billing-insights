@@ -234,7 +234,7 @@ The Lambda function requires the following permissions:
 - **CloudWatch**: `cloudwatch:GetMetricStatistics`
 - **RDS**: `rds:DescribeDBInstances`, `rds:DescribeDBClusters`
 - **S3**: `s3:ListAllMyBuckets`, `s3:GetBucketLocation`, `s3:GetBucketLifecycleConfiguration`, `s3:GetBucketTagging`, `s3:GetBucketVersioning`, `s3:GetIntelligentTieringConfiguration`, `s3:ListBucketVersions`
-- **Lambda**: `lambda:ListFunctions`, `lambda:GetFunction`
+- **Lambda**: `lambda:ListFunctions`, `lambda:GetFunction`, `lambda:ListProvisionedConcurrencyConfigs`
 - **Organizations**: `organizations:ListAccounts` (for linked accounts)
 - **Compute Optimizer**: `compute-optimizer:GetEC2InstanceRecommendations`, `compute-optimizer:GetEBSVolumeRecommendations`, `compute-optimizer:GetLambdaFunctionRecommendations`
 - **ElastiCache**: `elasticache:DescribeCacheClusters`, `elasticache:DescribeReplicationGroups`

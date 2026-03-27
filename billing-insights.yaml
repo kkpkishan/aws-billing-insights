@@ -233,6 +233,7 @@ Resources:
             - s3:ListBucketVersions
             - lambda:ListFunctions
             - lambda:GetFunction
+            - lambda:ListProvisionedConcurrencyConfigs
             - compute-optimizer:GetEC2InstanceRecommendations
             - compute-optimizer:GetEBSVolumeRecommendations
             - compute-optimizer:GetLambdaFunctionRecommendations
