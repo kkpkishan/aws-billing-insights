@@ -193,6 +193,7 @@ Resources:
             - ce:GetSavingsPlansUtilizationDetails
             - ce:GetSavingsPlansCoverage
             - ce:GetReservationUtilization
+            - ce:GetReservationCoverage
             Effect: Allow
             Resource: "*"
           - Action: [bedrock:InvokeModel]
@@ -1068,15 +1069,32 @@ Resources:
           def get_ri_utilization(ce, start, end):
               try:
                   print(f"[RI Utilization] Fetching data from {start} to {end}")
+                  
+                  # Try to get RI coverage first (shows active RIs)
+                  try:
+                      coverage_resp = ce.get_reservation_coverage(
+                          TimePeriod={'Start': start, 'End': end},
+                          Granularity='MONTHLY'
+                      )
+                      print(f"[RI Utilization] Coverage API response: {json.dumps(coverage_resp, default=str)[:500]}")
+                  except Exception as cov_err:
+                      print(f"[RI Utilization] Coverage API error: {cov_err}")
+                  
+                  # Get utilization data
                   resp = ce.get_reservation_utilization(
                       TimePeriod={'Start': start, 'End': end},
                       Granularity='MONTHLY'
                   )
                   
+                  print(f"[RI Utilization] Full API response: {json.dumps(resp, default=str)[:1000]}")
+                  
                   # FIXED: Check both Total and UtilizationsByTime for RI data
                   # Some accounts return data in UtilizationsByTime array
                   total = resp.get('Total', {})
                   utilizations_by_time = resp.get('UtilizationsByTime', [])
+                  
+                  print(f"[RI Utilization] Total object: {json.dumps(total, default=str)}")
+                  print(f"[RI Utilization] UtilizationsByTime count: {len(utilizations_by_time)}")
                   
                   # If Total is empty but UtilizationsByTime has data, aggregate it
                   if utilizations_by_time and not total.get('Utilization'):
@@ -1086,12 +1104,20 @@ Resources:
                       total_unused = 0
                       total_unused_cost = 0
                       
-                      for period in utilizations_by_time:
+                      for idx, period in enumerate(utilizations_by_time):
                           util = period.get('Utilization', {})
-                          total_purchased += float(util.get('PurchasedHours', 0))
-                          total_used += float(util.get('UsedHours', 0))
-                          total_unused += float(util.get('UnusedHours', 0))
-                          total_unused_cost += float(util.get('UnusedRecurringFee', 0))
+                          period_start = period.get('TimePeriod', {}).get('Start', 'unknown')
+                          purchased = float(util.get('PurchasedHours', 0))
+                          used = float(util.get('UsedHours', 0))
+                          unused = float(util.get('UnusedHours', 0))
+                          unused_cost = float(util.get('UnusedRecurringFee', 0))
+                          
+                          print(f"[RI Utilization] Period {idx} ({period_start}): Purchased={purchased}h, Used={used}h, Unused={unused}h, Cost=${unused_cost}")
+                          
+                          total_purchased += purchased
+                          total_used += used
+                          total_unused += unused
+                          total_unused_cost += unused_cost
                       
                       # Calculate utilization percentage
                       util_pct = (total_used / total_purchased * 100) if total_purchased > 0 else 0

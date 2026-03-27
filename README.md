@@ -227,7 +227,7 @@ Generated reports include:
 
 The Lambda function requires the following permissions:
 
-- **Cost Explorer**: `ce:GetCostAndUsage`, `ce:GetCostForecast`, `ce:GetSavingsPlansUtilizationDetails`, `ce:GetReservationUtilization`
+- **Cost Explorer**: `ce:GetCostAndUsage`, `ce:GetCostForecast`, `ce:GetSavingsPlansUtilizationDetails`, `ce:GetReservationUtilization`, `ce:GetReservationCoverage`
 - **Bedrock**: `bedrock:InvokeModel`
 - **SNS**: `sns:Publish`
 - **EC2**: `ec2:DescribeInstances`, `ec2:DescribeVolumes`, `ec2:DescribeAddresses`, `ec2:DescribeSnapshots`, `ec2:DescribeNatGateways`
